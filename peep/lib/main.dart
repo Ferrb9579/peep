@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'webrtc_peer_stub.dart' if (dart.library.html) 'webrtc_peer_web.dart';
@@ -78,6 +80,11 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
           });
         }
       },
+      onMediaChanged: () {
+        if (mounted) {
+          setState(() {});
+        }
+      },
     );
   }
 
@@ -109,6 +116,30 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
 
   Future<void> _disconnect() async {
     await _client.disconnect();
+  }
+
+  void _toggleCamera() {
+    unawaited(_client.setCameraEnabled(!_client.cameraEnabled));
+  }
+
+  void _toggleMicrophone() {
+    unawaited(_client.setMicrophoneEnabled(!_client.microphoneEnabled));
+  }
+
+  void _startCall() {
+    _client.startCall();
+  }
+
+  void _acceptCall() {
+    unawaited(_client.acceptCall());
+  }
+
+  void _declineCall() {
+    _client.declineCall();
+  }
+
+  void _endCall() {
+    unawaited(_client.endCall());
   }
 
   void _sendMessage() {
@@ -145,40 +176,62 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-
     return Scaffold(
       backgroundColor: const Color(0xfff7f3ea),
       appBar: AppBar(
         title: const Text('Peep'),
         backgroundColor: const Color(0xfff7f3ea),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: Chip(
-              avatar: Icon(_statusIcon(), size: 18),
-              label: Text(_statusLabel()),
-              backgroundColor: _statusColor(
-                colorScheme,
-              ).withValues(alpha: 0.15),
-              side: BorderSide(color: _statusColor(colorScheme)),
-            ),
-          ),
-        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
+            final colorScheme = Theme.of(context).colorScheme;
             final wide = constraints.maxWidth >= 900;
-            final setup = _SetupPanel(
-              signalingController: _signalingController,
-              roomController: _roomController,
-              peerController: _peerController,
-              enabled: !_isConnected,
+            if (!_isConnected) {
+              return Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 520),
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: _SetupPanel(
+                      signalingController: _signalingController,
+                      roomController: _roomController,
+                      peerController: _peerController,
+                      enabled: true,
+                      connected: false,
+                      onConnect: _connect,
+                      onDisconnect: _disconnect,
+                      logs: _logs,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            final chatHeader = _ChatHeader(
+              room: _roomController.text.trim(),
+              peer: _peerController.text.trim(),
+              statusLabel: _statusLabel(),
+              statusColor: _statusColor(colorScheme),
+              cameraEnabled: _client.cameraEnabled,
+              microphoneEnabled: _client.microphoneEnabled,
+              callState: _client.callState,
+              onBack: _disconnect,
+              onStartCall: _startCall,
+              onEndCall: _endCall,
+              onToggleCamera: _toggleCamera,
+              onToggleMicrophone: _toggleMicrophone,
+            );
+            final callNotice = _CallNotice(
+              callState: _client.callState,
+              onAccept: _acceptCall,
+              onDecline: _declineCall,
+              onEnd: _endCall,
+            );
+            final call = _CallPanel(
+              localVideoViewType: _client.localVideoViewType,
+              remoteVideoViewType: _client.remoteVideoViewType,
               connected: _isConnected,
-              onConnect: _connect,
-              onDisconnect: _disconnect,
-              logs: _logs,
             );
             final chat = _ChatPanel(
               messages: _messages,
@@ -189,26 +242,26 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
               onSend: _sendMessage,
             );
 
-            if (wide) {
-              return Padding(
-                padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    SizedBox(width: 360, child: setup),
-                    const SizedBox(width: 24),
-                    Expanded(child: chat),
-                  ],
-                ),
-              );
-            }
-
             return Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              padding: EdgeInsets.fromLTRB(
+                wide ? 24 : 16,
+                8,
+                wide ? 24 : 16,
+                wide ? 24 : 16,
+              ),
               child: Column(
                 children: [
-                  setup,
-                  const SizedBox(height: 16),
+                  chatHeader,
+                  if (_client.callState == CallState.incoming ||
+                      _client.callState == CallState.outgoing) ...[
+                    const SizedBox(height: 12),
+                    callNotice,
+                  ],
+                  if (_client.callState == CallState.active) ...[
+                    const SizedBox(height: 12),
+                    SizedBox(height: wide ? 280 : 260, child: call),
+                  ],
+                  const SizedBox(height: 12),
                   Expanded(child: chat),
                 ],
               ),
@@ -219,17 +272,11 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     );
   }
 
-  IconData _statusIcon() {
-    return switch (_status) {
-      PeerStatus.connected => Icons.hub,
-      PeerStatus.connecting || PeerStatus.signaling => Icons.sync,
-      PeerStatus.failed => Icons.error_outline,
-      PeerStatus.disconnected => Icons.link_off,
-      _ => Icons.radio_button_unchecked,
-    };
-  }
-
   String _statusLabel() {
+    if (_client.canSend) {
+      return 'Connected';
+    }
+
     return switch (_status) {
       PeerStatus.idle => 'Idle',
       PeerStatus.signaling => 'Signaling',
@@ -242,6 +289,10 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   }
 
   Color _statusColor(ColorScheme colorScheme) {
+    if (_client.canSend) {
+      return const Color(0xff287d4f);
+    }
+
     return switch (_status) {
       PeerStatus.connected => const Color(0xff287d4f),
       PeerStatus.connecting ||
@@ -250,6 +301,276 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       PeerStatus.failed => colorScheme.error,
       _ => const Color(0xff6b7280),
     };
+  }
+}
+
+class _ChatHeader extends StatelessWidget {
+  const _ChatHeader({
+    required this.room,
+    required this.peer,
+    required this.statusLabel,
+    required this.statusColor,
+    required this.cameraEnabled,
+    required this.microphoneEnabled,
+    required this.callState,
+    required this.onBack,
+    required this.onStartCall,
+    required this.onEndCall,
+    required this.onToggleCamera,
+    required this.onToggleMicrophone,
+  });
+
+  final String room;
+  final String peer;
+  final String statusLabel;
+  final Color statusColor;
+  final bool cameraEnabled;
+  final bool microphoneEnabled;
+  final CallState callState;
+  final VoidCallback onBack;
+  final VoidCallback onStartCall;
+  final VoidCallback onEndCall;
+  final VoidCallback onToggleCamera;
+  final VoidCallback onToggleMicrophone;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffded6c9)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          children: [
+            IconButton(
+              onPressed: onBack,
+              icon: const Icon(Icons.arrow_back),
+              tooltip: 'Disconnect',
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    room.isEmpty ? 'Direct chat' : room,
+                    style: Theme.of(context).textTheme.titleMedium,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    peer,
+                    style: Theme.of(context).textTheme.bodySmall,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+            Chip(
+              label: Text(statusLabel),
+              backgroundColor: statusColor.withValues(alpha: 0.15),
+              side: BorderSide(color: statusColor),
+            ),
+            const SizedBox(width: 8),
+            if (callState == CallState.idle)
+              IconButton.filled(
+                onPressed: onStartCall,
+                icon: const Icon(Icons.call),
+                tooltip: 'Start call',
+              )
+            else
+              IconButton.filled(
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xffb42318),
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: onEndCall,
+                icon: const Icon(Icons.call_end),
+                tooltip: 'End call',
+              ),
+            const SizedBox(width: 8),
+            if (callState == CallState.active) ...[
+              IconButton.filledTonal(
+                onPressed: onToggleMicrophone,
+                icon: Icon(microphoneEnabled ? Icons.mic : Icons.mic_off),
+                tooltip: microphoneEnabled ? 'Mute microphone' : 'Unmute audio',
+              ),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                onPressed: onToggleCamera,
+                icon: Icon(cameraEnabled ? Icons.videocam : Icons.videocam_off),
+                tooltip: cameraEnabled ? 'Turn camera off' : 'Start video',
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CallNotice extends StatelessWidget {
+  const _CallNotice({
+    required this.callState,
+    required this.onAccept,
+    required this.onDecline,
+    required this.onEnd,
+  });
+
+  final CallState callState;
+  final VoidCallback onAccept;
+  final VoidCallback onDecline;
+  final VoidCallback onEnd;
+
+  @override
+  Widget build(BuildContext context) {
+    final incoming = callState == CallState.incoming;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffded6c9)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        child: Row(
+          children: [
+            Icon(
+              incoming ? Icons.call_received : Icons.call_made,
+              color: const Color(0xff1f7a8c),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                incoming ? 'Incoming audio call' : 'Calling...',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            if (incoming) ...[
+              FilledButton.icon(
+                onPressed: onAccept,
+                icon: const Icon(Icons.call),
+                label: const Text('Accept'),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: onDecline,
+                icon: const Icon(Icons.call_end),
+                label: const Text('Decline'),
+              ),
+            ] else
+              OutlinedButton.icon(
+                onPressed: onEnd,
+                icon: const Icon(Icons.call_end),
+                label: const Text('Cancel'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CallPanel extends StatelessWidget {
+  const _CallPanel({
+    required this.localVideoViewType,
+    required this.remoteVideoViewType,
+    required this.connected,
+  });
+
+  final String? localVideoViewType;
+  final String? remoteVideoViewType;
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffded6c9)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            Expanded(
+              child: _VideoTile(
+                title: 'Remote',
+                viewType: remoteVideoViewType,
+                placeholder: connected
+                    ? 'Waiting for remote video'
+                    : 'Connect to start a call',
+              ),
+            ),
+            const SizedBox(width: 12),
+            SizedBox(
+              width: 240,
+              child: _VideoTile(
+                title: 'You',
+                viewType: localVideoViewType,
+                placeholder: connected ? 'Starting camera' : 'Local preview',
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoTile extends StatelessWidget {
+  const _VideoTile({
+    required this.title,
+    required this.viewType,
+    required this.placeholder,
+  });
+
+  final String title;
+  final String? viewType;
+  final String placeholder;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          ColoredBox(
+            color: const Color(0xff111827),
+            child: viewType == null
+                ? Center(
+                    child: Text(
+                      placeholder,
+                      style: const TextStyle(color: Color(0xffcbd5e1)),
+                    ),
+                  )
+                : HtmlElementView(viewType: viewType!),
+          ),
+          Positioned(
+            left: 10,
+            top: 10,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: Text(
+                  title,
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -476,8 +797,7 @@ class _ChatPanel extends StatelessWidget {
                     textInputAction: TextInputAction.send,
                     onSubmitted: canType ? (_) => onSend() : null,
                     decoration: const InputDecoration(
-                      hintText:
-                          'Type a message while the peer connection opens',
+                      hintText: 'Type a message',
                       border: OutlineInputBorder(),
                     ),
                   ),
