@@ -153,6 +153,10 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     _scrollToEnd();
   }
 
+  void _sendAttachment() {
+    unawaited(_client.pickAndSendAttachment());
+  }
+
   void _addLog(String message) {
     setState(() {
       _logs
@@ -215,6 +219,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
               statusColor: _statusColor(colorScheme),
               cameraEnabled: _client.cameraEnabled,
               microphoneEnabled: _client.microphoneEnabled,
+              encryptionReady: _client.encryptionReady,
               callState: _client.callState,
               onBack: _disconnect,
               onStartCall: _startCall,
@@ -238,8 +243,9 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
               scrollController: _scrollController,
               messageController: _messageController,
               canType: _isConnected,
-              canSend: _client.canSend,
+              canSend: _client.canMessage,
               onSend: _sendMessage,
+              onAttach: _sendAttachment,
             );
 
             return Padding(
@@ -312,6 +318,7 @@ class _ChatHeader extends StatelessWidget {
     required this.statusColor,
     required this.cameraEnabled,
     required this.microphoneEnabled,
+    required this.encryptionReady,
     required this.callState,
     required this.onBack,
     required this.onStartCall,
@@ -326,6 +333,7 @@ class _ChatHeader extends StatelessWidget {
   final Color statusColor;
   final bool cameraEnabled;
   final bool microphoneEnabled;
+  final bool encryptionReady;
   final CallState callState;
   final VoidCallback onBack;
   final VoidCallback onStartCall;
@@ -373,6 +381,18 @@ class _ChatHeader extends StatelessWidget {
               label: Text(statusLabel),
               backgroundColor: statusColor.withValues(alpha: 0.15),
               side: BorderSide(color: statusColor),
+            ),
+            const SizedBox(width: 8),
+            Tooltip(
+              message: encryptionReady
+                  ? 'End-to-end encryption ready'
+                  : 'Setting up end-to-end encryption',
+              child: Icon(
+                encryptionReady ? Icons.lock : Icons.lock_clock,
+                color: encryptionReady
+                    ? const Color(0xff287d4f)
+                    : const Color(0xffb26a00),
+              ),
             ),
             const SizedBox(width: 8),
             if (callState == CallState.idle)
@@ -708,6 +728,7 @@ class _ChatPanel extends StatelessWidget {
     required this.canType,
     required this.canSend,
     required this.onSend,
+    required this.onAttach,
   });
 
   final List<ChatMessage> messages;
@@ -716,6 +737,7 @@ class _ChatPanel extends StatelessWidget {
   final bool canType;
   final bool canSend;
   final VoidCallback onSend;
+  final VoidCallback onAttach;
 
   @override
   Widget build(BuildContext context) {
@@ -751,6 +773,7 @@ class _ChatPanel extends StatelessWidget {
                     itemCount: messages.length,
                     itemBuilder: (context, index) {
                       final message = messages[index];
+                      final attachment = message.attachment;
                       return Align(
                         alignment: message.isLocal
                             ? Alignment.centerRight
@@ -769,14 +792,19 @@ class _ChatPanel extends StatelessWidget {
                                   : const Color(0xffedf2f4),
                               borderRadius: BorderRadius.circular(8),
                             ),
-                            child: Text(
-                              message.text,
-                              style: TextStyle(
-                                color: message.isLocal
-                                    ? Colors.white
-                                    : const Color(0xff111827),
-                              ),
-                            ),
+                            child: attachment == null
+                                ? Text(
+                                    message.text,
+                                    style: TextStyle(
+                                      color: message.isLocal
+                                          ? Colors.white
+                                          : const Color(0xff111827),
+                                    ),
+                                  )
+                                : _AttachmentBubble(
+                                    attachment: attachment,
+                                    isLocal: message.isLocal,
+                                  ),
                           ),
                         ),
                       );
@@ -788,6 +816,12 @@ class _ChatPanel extends StatelessWidget {
             padding: const EdgeInsets.all(12),
             child: Row(
               children: [
+                IconButton.filledTonal(
+                  onPressed: canSend ? onAttach : null,
+                  icon: const Icon(Icons.attach_file),
+                  tooltip: 'Attach audio or video',
+                ),
+                const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
                     controller: messageController,
@@ -814,5 +848,73 @@ class _ChatPanel extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class _AttachmentBubble extends StatelessWidget {
+  const _AttachmentBubble({required this.attachment, required this.isLocal});
+
+  final AttachmentData attachment;
+  final bool isLocal;
+
+  @override
+  Widget build(BuildContext context) {
+    final textColor = isLocal ? Colors.white : const Color(0xff111827);
+    final mediaHeight = attachment.isVideo ? 220.0 : 48.0;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              attachment.isVideo
+                  ? Icons.movie_outlined
+                  : Icons.audio_file_outlined,
+              size: 20,
+              color: textColor,
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                attachment.name,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: textColor, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '${attachment.mimeType} • ${_formatBytes(attachment.size)}',
+          style: TextStyle(color: textColor.withValues(alpha: 0.82)),
+        ),
+        if (attachment.viewType != null) ...[
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              width: 460,
+              height: mediaHeight,
+              child: HtmlElementView(viewType: attachment.viewType!),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+    final kb = bytes / 1024;
+    if (kb < 1024) {
+      return '${kb.toStringAsFixed(1)} KB';
+    }
+    final mb = kb / 1024;
+    return '${mb.toStringAsFixed(1)} MB';
   }
 }

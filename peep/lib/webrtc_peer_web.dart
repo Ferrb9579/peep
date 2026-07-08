@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:html' as html;
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
+import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 enum PeerStatus {
@@ -19,16 +20,50 @@ enum PeerStatus {
 
 enum CallState { idle, outgoing, incoming, active }
 
+class AttachmentData {
+  const AttachmentData({
+    required this.name,
+    required this.mimeType,
+    required this.size,
+    required this.dataUrl,
+    this.viewType,
+  });
+
+  final String name;
+  final String mimeType;
+  final int size;
+  final String dataUrl;
+  final String? viewType;
+
+  bool get isAudio => mimeType.startsWith('audio/');
+  bool get isVideo => mimeType.startsWith('video/');
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.text,
     required this.isLocal,
     required this.sentAt,
+    this.attachment,
   });
 
   final String text;
   final bool isLocal;
   final DateTime sentAt;
+  final AttachmentData? attachment;
+}
+
+class _IncomingAttachment {
+  _IncomingAttachment({
+    required this.name,
+    required this.mimeType,
+    required this.size,
+  });
+
+  final String name;
+  final String mimeType;
+  final int size;
+  final StringBuffer data = StringBuffer();
 }
 
 class PeerClient {
@@ -57,6 +92,11 @@ class PeerClient {
   late final String _remoteVideoViewType;
   final List<Map<String, dynamic>> _pendingCandidates = [];
   final List<String> _pendingMessages = [];
+  final List<Map<String, dynamic>> _pendingEncryptedPayloads = [];
+  final Map<String, _IncomingAttachment> _incomingAttachments = {};
+  JSAny? _privateKey;
+  JSAny? _aesKey;
+  String? _roomKeyStorageKey;
   bool _remoteDescriptionSet = false;
   bool _offerStarted = false;
   bool _closed = false;
@@ -64,10 +104,16 @@ class PeerClient {
   bool _microphoneEnabled = false;
   CallState _callState = CallState.idle;
   static int _nextViewId = 0;
+  static int _nextAttachmentId = 0;
+  static const int _attachmentChunkSize = 16 * 1024;
 
   bool get canSend => _dataChannel?.readyState == 'open';
+  bool get canStoreOffline =>
+      _socket?.readyState == html.WebSocket.OPEN && encryptionReady;
+  bool get canMessage => canSend || canStoreOffline;
   bool get cameraEnabled => _cameraEnabled;
   bool get microphoneEnabled => _microphoneEnabled;
+  bool get encryptionReady => _aesKey != null;
   CallState get callState => _callState;
   bool get callActive => _callState != CallState.idle;
   String get localVideoViewType => _localVideoViewType;
@@ -116,6 +162,12 @@ class PeerClient {
     _callState = CallState.idle;
     _pendingCandidates.clear();
     _pendingMessages.clear();
+    _pendingEncryptedPayloads.clear();
+    _incomingAttachments.clear();
+    _privateKey = null;
+    _aesKey = null;
+    _roomKeyStorageKey = 'peep:e2ee-room:${room.trim()}';
+    await _loadPersistedRoomKey();
 
     onStatus(PeerStatus.signaling);
     _peerConnection = html.RtcPeerConnection({'iceServers': []});
@@ -141,13 +193,59 @@ class PeerClient {
   }
 
   void send(String text) {
-    if (!canSend) {
+    if (!canMessage) {
       _pendingMessages.add(text);
-      onLog('Queued message until the data channel opens.');
+      onLog('Queued message until an encrypted channel is ready.');
       return;
     }
 
     _sendDataChannelMessage(text);
+  }
+
+  Future<void> pickAndSendAttachment() async {
+    if (!canMessage) {
+      onLog('Connect encrypted chat before sending an attachment.');
+      return;
+    }
+
+    final input = html.FileUploadInputElement()
+      ..accept = 'audio/*,video/*'
+      ..multiple = false;
+    final completer = Completer<html.File?>();
+    input.onChange.first.then((_) {
+      completer.complete(
+        input.files?.isNotEmpty == true ? input.files!.first : null,
+      );
+    });
+    input.click();
+
+    final file = await completer.future;
+    if (file == null) {
+      return;
+    }
+    if (!file.type.startsWith('audio/') && !file.type.startsWith('video/')) {
+      onLog('Choose an audio or video file.');
+      return;
+    }
+
+    final dataUrl = await _readFileAsDataUrl(file);
+    final attachment = _createAttachmentData(
+      name: file.name,
+      mimeType: file.type,
+      size: file.size,
+      dataUrl: dataUrl,
+    );
+
+    onMessage(
+      ChatMessage(
+        text: file.name,
+        isLocal: true,
+        sentAt: DateTime.now(),
+        attachment: attachment,
+      ),
+    );
+
+    await _sendAttachment(file: file, dataUrl: dataUrl);
   }
 
   void startCall() {
@@ -277,6 +375,11 @@ class PeerClient {
     _localVideo.srcObject = null;
     _remoteVideo.srcObject = null;
     _pendingMessages.clear();
+    _pendingEncryptedPayloads.clear();
+    _incomingAttachments.clear();
+    _privateKey = null;
+    _aesKey = null;
+    _roomKeyStorageKey = null;
     onStatus(PeerStatus.disconnected);
     onMediaChanged();
   }
@@ -379,14 +482,14 @@ class PeerClient {
     _dataChannel = channel;
 
     channel.onOpen.listen((_) {
-      onStatus(PeerStatus.connected);
-      onLog('Data channel opened.');
-      _flushPendingMessages();
+      unawaited(_handleDataChannelOpen());
     });
 
     channel.onClose.listen((_) {
       if (!_closed) {
-        onStatus(PeerStatus.disconnected);
+        _dataChannel = null;
+        onStatus(PeerStatus.waitingForPeer);
+        onMediaChanged();
       }
       onLog('Data channel closed.');
     });
@@ -399,47 +502,79 @@ class PeerClient {
     });
   }
 
+  Future<void> _handleDataChannelOpen() async {
+    onStatus(PeerStatus.connected);
+    onLog('Data channel opened.');
+    try {
+      await _startEncryptionHandshake();
+      _flushPendingMessages();
+    } catch (error) {
+      onStatus(PeerStatus.failed);
+      onLog('E2EE setup failed: $error');
+    }
+  }
+
   void _handleDataChannelMessage(String raw) {
     try {
       final decoded = jsonDecode(raw);
       if (decoded is Map<String, dynamic>) {
-        switch (decoded['kind']) {
-          case 'chat':
-            final text = decoded['text'];
-            if (text is String) {
-              onMessage(
-                ChatMessage(text: text, isLocal: false, sentAt: DateTime.now()),
-              );
-            }
-            return;
-          case 'call-request':
-            if (_callState == CallState.idle) {
-              _callState = CallState.incoming;
-              onLog('Incoming call request.');
-              onMediaChanged();
-            } else {
-              _sendControl({'kind': 'call-decline'});
-            }
-            return;
-          case 'call-accept':
-            unawaited(_handleCallAccepted());
-            return;
-          case 'call-decline':
-            if (_callState == CallState.outgoing) {
-              _callState = CallState.idle;
-              onLog('Call declined.');
-              onMediaChanged();
-            }
-            return;
-          case 'call-end':
-            unawaited(_stopCallMedia());
-            onLog('Peer ended the call.');
-            return;
+        if (decoded['kind'] == 'e2ee-key') {
+          unawaited(_handleEncryptionKey(decoded));
+          return;
         }
+        if (decoded['kind'] == 'e2ee') {
+          unawaited(_handleEncryptedPayload(decoded));
+          return;
+        }
+        onLog('Ignored unencrypted data-channel payload.');
       }
     } catch (_) {
-      onMessage(ChatMessage(text: raw, isLocal: false, sentAt: DateTime.now()));
-      return;
+      onLog('Ignored unreadable data-channel payload.');
+    }
+  }
+
+  void _handleAppPayload(Map<String, dynamic> decoded) {
+    switch (decoded['kind']) {
+      case 'chat':
+        final text = decoded['text'];
+        if (text is String) {
+          onMessage(
+            ChatMessage(text: text, isLocal: false, sentAt: DateTime.now()),
+          );
+        }
+        return;
+      case 'attachment-start':
+        _handleAttachmentStart(decoded);
+        return;
+      case 'attachment-chunk':
+        _handleAttachmentChunk(decoded);
+        return;
+      case 'attachment-end':
+        _handleAttachmentEnd(decoded);
+        return;
+      case 'call-request':
+        if (_callState == CallState.idle) {
+          _callState = CallState.incoming;
+          onLog('Incoming call request.');
+          onMediaChanged();
+        } else {
+          unawaited(_sendControl({'kind': 'call-decline'}));
+        }
+        return;
+      case 'call-accept':
+        unawaited(_handleCallAccepted());
+        return;
+      case 'call-decline':
+        if (_callState == CallState.outgoing) {
+          _callState = CallState.idle;
+          onLog('Call declined.');
+          onMediaChanged();
+        }
+        return;
+      case 'call-end':
+        unawaited(_stopCallMedia());
+        onLog('Peer ended the call.');
+        return;
     }
   }
 
@@ -489,17 +624,416 @@ class PeerClient {
   }
 
   void _sendDataChannelMessage(String text) {
-    _dataChannel!.sendString(jsonEncode({'kind': 'chat', 'text': text}));
+    unawaited(_sendControl({'kind': 'chat', 'text': text}));
     onMessage(ChatMessage(text: text, isLocal: true, sentAt: DateTime.now()));
   }
 
-  void _sendControl(Map<String, dynamic> message) {
+  Future<void> _sendAttachment({
+    required html.File file,
+    required String dataUrl,
+  }) async {
+    final id =
+        'attachment-${DateTime.now().microsecondsSinceEpoch}-${_nextAttachmentId++}';
+    await _sendControl({
+      'kind': 'attachment-start',
+      'id': id,
+      'name': file.name,
+      'mimeType': file.type,
+      'size': file.size,
+    });
+
+    for (
+      var offset = 0;
+      offset < dataUrl.length;
+      offset += _attachmentChunkSize
+    ) {
+      final chunkEnd = offset + _attachmentChunkSize;
+      final end = chunkEnd > dataUrl.length ? dataUrl.length : chunkEnd;
+      await _sendControl({
+        'kind': 'attachment-chunk',
+        'id': id,
+        'data': dataUrl.substring(offset, end),
+      });
+      await _waitForBufferedAmount();
+    }
+
+    await _sendControl({'kind': 'attachment-end', 'id': id});
+    onLog('Attachment sent: ${file.name}.');
+  }
+
+  Future<String> _readFileAsDataUrl(html.File file) {
+    final completer = Completer<String>();
+    final reader = html.FileReader();
+
+    reader.onLoad.first.then((_) {
+      final result = reader.result;
+      if (result is String) {
+        completer.complete(result);
+      } else {
+        completer.completeError(StateError('Could not read attachment.'));
+      }
+    });
+    reader.onError.first.then((_) {
+      completer.completeError(StateError('Could not read attachment.'));
+    });
+    reader.readAsDataUrl(file);
+
+    return completer.future;
+  }
+
+  Future<void> _waitForBufferedAmount() async {
+    while ((_dataChannel?.bufferedAmount ?? 0) > 512 * 1024) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+  }
+
+  void _handleAttachmentStart(Map<String, dynamic> message) {
+    final id = message['id'];
+    final name = message['name'];
+    final mimeType = message['mimeType'];
+    final size = message['size'];
+    if (id is! String ||
+        name is! String ||
+        mimeType is! String ||
+        size is! int) {
+      return;
+    }
+
+    _incomingAttachments[id] = _IncomingAttachment(
+      name: name,
+      mimeType: mimeType,
+      size: size,
+    );
+    onLog('Receiving attachment: $name.');
+  }
+
+  void _handleAttachmentChunk(Map<String, dynamic> message) {
+    final id = message['id'];
+    final data = message['data'];
+    if (id is! String || data is! String) {
+      return;
+    }
+
+    _incomingAttachments[id]?.data.write(data);
+  }
+
+  void _handleAttachmentEnd(Map<String, dynamic> message) {
+    final id = message['id'];
+    if (id is! String) {
+      return;
+    }
+
+    final incoming = _incomingAttachments.remove(id);
+    if (incoming == null) {
+      return;
+    }
+
+    final attachment = _createAttachmentData(
+      name: incoming.name,
+      mimeType: incoming.mimeType,
+      size: incoming.size,
+      dataUrl: incoming.data.toString(),
+    );
+    onMessage(
+      ChatMessage(
+        text: incoming.name,
+        isLocal: false,
+        sentAt: DateTime.now(),
+        attachment: attachment,
+      ),
+    );
+    onLog('Attachment received: ${incoming.name}.');
+  }
+
+  AttachmentData _createAttachmentData({
+    required String name,
+    required String mimeType,
+    required int size,
+    required String dataUrl,
+  }) {
+    final isAudio = mimeType.startsWith('audio/');
+    final isVideo = mimeType.startsWith('video/');
+    String? viewType;
+
+    if (isAudio || isVideo) {
+      viewType =
+          'peep-attachment-${DateTime.now().microsecondsSinceEpoch}-${_nextAttachmentId++}';
+      ui_web.platformViewRegistry.registerViewFactory(viewType, (int viewId) {
+        if (isVideo) {
+          return html.VideoElement()
+            ..src = dataUrl
+            ..controls = true
+            ..preload = 'metadata'
+            ..setAttribute('playsinline', 'true')
+            ..style.width = '100%'
+            ..style.height = '100%'
+            ..style.objectFit = 'cover'
+            ..style.backgroundColor = '#111827';
+        }
+
+        return html.AudioElement()
+          ..src = dataUrl
+          ..controls = true
+          ..preload = 'metadata'
+          ..style.width = '100%';
+      });
+    }
+
+    return AttachmentData(
+      name: name,
+      mimeType: mimeType,
+      size: size,
+      dataUrl: dataUrl,
+      viewType: viewType,
+    );
+  }
+
+  Future<void> _sendControl(Map<String, dynamic> message) async {
+    if (!encryptionReady) {
+      _pendingEncryptedPayloads.add(message);
+      onLog('Queued encrypted payload until E2EE is ready.');
+      return;
+    }
+
+    final plaintext = Uint8List.fromList(utf8.encode(jsonEncode(message)));
+    final iv = Uint8List(12);
+    html.window.crypto!.getRandomValues(iv);
+    final ciphertext = await _encryptBytes(plaintext: plaintext, iv: iv);
+    final envelope = {
+      'kind': 'e2ee',
+      'iv': base64Encode(iv),
+      'ciphertext': base64Encode(ciphertext),
+    };
+
+    if (canSend) {
+      _sendPlainDataChannel(envelope);
+      return;
+    }
+    if (canStoreOffline) {
+      _storeEncryptedPayload(envelope);
+      return;
+    }
+
+    onLog('No encrypted transport or offline mailbox is available.');
+  }
+
+  void _sendPlainDataChannel(Map<String, dynamic> message) {
     if (!canSend) {
       onLog('Data channel is not open.');
       return;
     }
 
     _dataChannel!.sendString(jsonEncode(message));
+  }
+
+  void _storeEncryptedPayload(Map<String, dynamic> envelope) {
+    final socket = _socket;
+    if (socket == null || socket.readyState != html.WebSocket.OPEN) {
+      onLog('Signaling socket is not open.');
+      return;
+    }
+
+    socket.sendString(jsonEncode({'type': 'store', 'payload': envelope}));
+    onLog('Stored encrypted payload for offline delivery.');
+  }
+
+  Future<void> _startEncryptionHandshake() async {
+    final subtle = _subtleCrypto;
+    final keyPair = await subtle
+        .callMethod<JSPromise<JSObject>>(
+          'generateKey'.toJS,
+          {'name': 'ECDH', 'namedCurve': 'P-256'}.jsify(),
+          true.toJS,
+          ['deriveKey'].jsify(),
+        )
+        .toDart;
+    _privateKey = keyPair['privateKey'];
+    final publicKey = keyPair['publicKey'];
+    if (_privateKey == null || publicKey == null) {
+      throw StateError('Could not generate E2EE key pair.');
+    }
+
+    final publicBytes = await subtle
+        .callMethod<JSPromise<JSArrayBuffer>>(
+          'exportKey'.toJS,
+          'raw'.toJS,
+          publicKey,
+        )
+        .toDart;
+    _sendPlainDataChannel({
+      'kind': 'e2ee-key',
+      'publicKey': base64Encode(publicBytes.toDart.asUint8List()),
+    });
+    onLog('E2EE key sent.');
+  }
+
+  Future<void> _handleEncryptionKey(Map<String, dynamic> message) async {
+    final publicKey = message['publicKey'];
+    if (publicKey is! String || _privateKey == null) {
+      return;
+    }
+
+    final subtle = _subtleCrypto;
+    final peerPublicKey = await subtle.callMethodVarArgs<JSPromise<JSAny>>(
+      'importKey'.toJS,
+      [
+        'raw'.toJS,
+        Uint8List.fromList(base64Decode(publicKey)).toJS,
+        {'name': 'ECDH', 'namedCurve': 'P-256'}.jsify(),
+        true.toJS,
+        <String>[].jsify(),
+      ],
+    ).toDart;
+
+    final deriveParams = {'name': 'ECDH'}.jsify() as JSObject;
+    deriveParams['public'] = peerPublicKey;
+    _aesKey = await subtle.callMethodVarArgs<JSPromise<JSAny>>(
+      'deriveKey'.toJS,
+      [
+        deriveParams,
+        _privateKey,
+        {'name': 'AES-GCM', 'length': 256}.jsify(),
+        true.toJS,
+        ['encrypt', 'decrypt'].jsify(),
+      ],
+    ).toDart;
+    await _persistRoomKey();
+    onLog('E2EE ready.');
+    onMediaChanged();
+    unawaited(_flushPendingEncryptedPayloads());
+  }
+
+  Future<void> _handleEncryptedPayload(Map<String, dynamic> message) async {
+    if (!encryptionReady) {
+      onLog('Encrypted payload arrived before E2EE was ready.');
+      return;
+    }
+
+    final iv = message['iv'];
+    final ciphertext = message['ciphertext'];
+    if (iv is! String || ciphertext is! String) {
+      return;
+    }
+
+    try {
+      final plaintext = await _decryptBytes(
+        ciphertext: Uint8List.fromList(base64Decode(ciphertext)),
+        iv: Uint8List.fromList(base64Decode(iv)),
+      );
+      final decoded = jsonDecode(utf8.decode(plaintext));
+      if (decoded is Map<String, dynamic>) {
+        _handleAppPayload(decoded);
+      }
+    } catch (error) {
+      onLog('Could not decrypt payload: $error');
+    }
+  }
+
+  Future<void> _flushPendingEncryptedPayloads() async {
+    if (!encryptionReady || _pendingEncryptedPayloads.isEmpty) {
+      return;
+    }
+
+    final payloads = List<Map<String, dynamic>>.from(_pendingEncryptedPayloads);
+    _pendingEncryptedPayloads.clear();
+    for (final payload in payloads) {
+      await _sendControl(payload);
+    }
+  }
+
+  Future<void> _loadPersistedRoomKey() async {
+    final storageKey = _roomKeyStorageKey;
+    if (storageKey == null) {
+      return;
+    }
+
+    final encodedKey = html.window.localStorage[storageKey];
+    if (encodedKey == null || encodedKey.isEmpty) {
+      return;
+    }
+
+    try {
+      _aesKey = await _subtleCrypto.callMethodVarArgs<JSPromise<JSAny>>(
+        'importKey'.toJS,
+        [
+          'raw'.toJS,
+          Uint8List.fromList(base64Decode(encodedKey)).toJS,
+          {'name': 'AES-GCM'}.jsify(),
+          true.toJS,
+          ['encrypt', 'decrypt'].jsify(),
+        ],
+      ).toDart;
+      onLog('Loaded saved E2EE room key.');
+      onMediaChanged();
+    } catch (error) {
+      html.window.localStorage.remove(storageKey);
+      onLog('Saved E2EE room key could not be loaded: $error');
+    }
+  }
+
+  Future<void> _persistRoomKey() async {
+    final storageKey = _roomKeyStorageKey;
+    if (storageKey == null || _aesKey == null) {
+      return;
+    }
+
+    try {
+      final rawKey = await _subtleCrypto
+          .callMethod<JSPromise<JSArrayBuffer>>(
+            'exportKey'.toJS,
+            'raw'.toJS,
+            _aesKey,
+          )
+          .toDart;
+      html.window.localStorage[storageKey] = base64Encode(
+        rawKey.toDart.asUint8List(),
+      );
+    } catch (error) {
+      onLog('Could not persist E2EE room key: $error');
+    }
+  }
+
+  Future<Uint8List> _encryptBytes({
+    required Uint8List plaintext,
+    required Uint8List iv,
+  }) async {
+    final params = {'name': 'AES-GCM'}.jsify() as JSObject;
+    params['iv'] = iv.toJS;
+    final ciphertext = await _subtleCrypto
+        .callMethod<JSPromise<JSArrayBuffer>>(
+          'encrypt'.toJS,
+          params,
+          _aesKey,
+          plaintext.toJS,
+        )
+        .toDart;
+    return ciphertext.toDart.asUint8List();
+  }
+
+  Future<Uint8List> _decryptBytes({
+    required Uint8List ciphertext,
+    required Uint8List iv,
+  }) async {
+    final params = {'name': 'AES-GCM'}.jsify() as JSObject;
+    params['iv'] = iv.toJS;
+    final plaintext = await _subtleCrypto
+        .callMethod<JSPromise<JSArrayBuffer>>(
+          'decrypt'.toJS,
+          params,
+          _aesKey,
+          ciphertext.toJS,
+        )
+        .toDart;
+    return plaintext.toDart.asUint8List();
+  }
+
+  JSObject get _subtleCrypto {
+    final crypto = JSObject.fromInteropObject(html.window.crypto!);
+    final subtle = crypto['subtle'];
+    if (subtle == null) {
+      throw StateError('WebCrypto is unavailable.');
+    }
+    return subtle as JSObject;
   }
 
   Future<void> _connectSocket(Uri uri) {
@@ -570,7 +1104,18 @@ class PeerClient {
           await _handleWelcome(decoded);
           break;
         case 'presence':
+          if (decoded['event'] == 'left') {
+            _dataChannel = null;
+            onStatus(PeerStatus.waitingForPeer);
+            onMediaChanged();
+          }
           onLog('Peer ${decoded['peer']} ${decoded['event']}.');
+          break;
+        case 'stored':
+          final payload = decoded['payload'];
+          if (payload is Map<String, dynamic>) {
+            unawaited(_handleEncryptedPayload(payload));
+          }
           break;
         case 'error':
           onStatus(PeerStatus.failed);

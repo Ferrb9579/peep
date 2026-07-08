@@ -10,16 +10,37 @@ enum PeerStatus {
 
 enum CallState { idle, outgoing, incoming, active }
 
+class AttachmentData {
+  const AttachmentData({
+    required this.name,
+    required this.mimeType,
+    required this.size,
+    required this.dataUrl,
+    this.viewType,
+  });
+
+  final String name;
+  final String mimeType;
+  final int size;
+  final String dataUrl;
+  final String? viewType;
+
+  bool get isAudio => mimeType.startsWith('audio/');
+  bool get isVideo => mimeType.startsWith('video/');
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.text,
     required this.isLocal,
     required this.sentAt,
+    this.attachment,
   });
 
   final String text;
   final bool isLocal;
   final DateTime sentAt;
+  final AttachmentData? attachment;
 }
 
 class PeerClient {
@@ -36,8 +57,10 @@ class PeerClient {
   final void Function() onMediaChanged;
 
   bool get canSend => false;
+  bool get canMessage => false;
   bool get cameraEnabled => false;
   bool get microphoneEnabled => false;
+  bool get encryptionReady => false;
   CallState get callState => CallState.idle;
   bool get callActive => false;
   String? get localVideoViewType => null;
@@ -54,6 +77,10 @@ class PeerClient {
 
   void send(String text) {
     onLog('Cannot send until a web data channel is connected.');
+  }
+
+  Future<void> pickAndSendAttachment() async {
+    onLog('Attachments are only available in Flutter web builds.');
   }
 
   Future<void> setCameraEnabled(bool enabled) async {
