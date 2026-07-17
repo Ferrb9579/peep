@@ -1,3 +1,22 @@
+import 'package:flutter/widgets.dart';
+import 'dart:async';
+
+Future<void> initializePlatformServices() async {}
+
+Future<void> startMessageNotifications({
+  required Uri signalingUri,
+  required AuthSession session,
+}) async {}
+
+Future<void> stopMessageNotifications() async {}
+
+Stream<String> get messageNotificationTaps => const Stream.empty();
+Future<String?> takeInitialMessageNotificationContact() async => null;
+
+Widget buildPlatformMediaView(String viewType) {
+  return const SizedBox.shrink();
+}
+
 enum PeerStatus {
   idle,
   signaling,

@@ -114,7 +114,10 @@ async fn handle_connection(
 
     let room_is_full = {
         let rooms = rooms.lock().await;
-        !room.starts_with("group:") && rooms.get(&room).is_some_and(|peers| peers.len() >= 2)
+        !room.starts_with("group:")
+            && rooms
+                .get(&room)
+                .is_some_and(|peers| peers.len() >= 2 && !peers.contains_key(&peer))
     };
 
     if room_is_full {
@@ -179,7 +182,15 @@ async fn handle_connection(
     {
         let mut rooms = rooms.lock().await;
         if let Some(peers) = rooms.get_mut(&room) {
-            peers.remove(&peer);
+            // A user may reconnect before an older socket notices that it has
+            // closed. Only remove this connection's sender so the stale socket
+            // cannot evict the replacement connection from the room.
+            if peers
+                .get(&peer)
+                .is_some_and(|current| current.same_channel(&tx))
+            {
+                peers.remove(&peer);
+            }
             if peers.is_empty() {
                 rooms.remove(&room);
             }
@@ -491,6 +502,13 @@ fn authenticated_route(
         .session(&token)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "auth token is invalid"))?;
 
+    if query_param(request, "watch").as_deref() == Some("1") {
+        return Ok(Some((
+            format!("notify:{}", session.username),
+            session.username,
+        )));
+    }
+
     if let Some(group_id) = query_param(request, "group") {
         if !groups.is_member(&session.username, &group_id)? {
             return Err(io::Error::new(
@@ -600,7 +618,7 @@ async fn read_loop(
     peer: String,
 ) -> io::Result<()> {
     while let Some(message) = read_text_frame(&mut reader).await? {
-        if store_message(&mailbox, &room, &peer, &message) {
+        if store_message(&mailbox, &rooms, &room, &peer, &message).await {
             continue;
         }
 
@@ -620,7 +638,13 @@ async fn read_loop(
     Ok(())
 }
 
-fn store_message(mailbox: &MailboxStore, room: &str, peer: &str, raw: &str) -> bool {
+async fn store_message(
+    mailbox: &MailboxStore,
+    rooms: &Rooms,
+    room: &str,
+    peer: &str,
+    raw: &str,
+) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
         return false;
     };
@@ -632,10 +656,53 @@ fn store_message(mailbox: &MailboxStore, room: &str, peer: &str, raw: &str) -> b
     };
 
     match mailbox.store(room, peer, payload) {
-        Ok(()) => println!("stored encrypted payload from {peer} in room {room}"),
+        Ok(()) => {
+            println!("stored encrypted payload from {peer} in room {room}");
+            if let Some(recipient) = mailbox_recipient(room, peer) {
+                notify_mailbox_ready(rooms, recipient, room, peer).await;
+            }
+        }
         Err(error) => eprintln!("failed to persist encrypted mailbox payload: {error}"),
     }
     true
+}
+
+fn mailbox_recipient<'a>(room: &'a str, sender: &str) -> Option<&'a str> {
+    let mut parts = room.split(':');
+    if parts.next()? != "dm" {
+        return None;
+    }
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if first == sender {
+        Some(second)
+    } else if second == sender {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+async fn notify_mailbox_ready(rooms: &Rooms, recipient: &str, room: &str, sender: &str) {
+    let listeners = {
+        let rooms = rooms.lock().await;
+        rooms
+            .get(&format!("notify:{recipient}"))
+            .map(|peers| peers.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let event = json!({
+        "type": "mailbox-ready",
+        "room": room,
+        "from": sender,
+    })
+    .to_string();
+    for listener in listeners {
+        let _ = listener.send(event.clone());
+    }
 }
 
 fn deliver_stored_messages(mailbox: &MailboxStore, room: &str, peer: &str, tx: &PeerSender) {

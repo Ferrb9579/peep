@@ -1,10 +1,20 @@
+// Legacy inline widgets remain during the screen migration; new mobile shell
+// components live in lib/ui.
+// ignore_for_file: unused_element
+
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import 'webrtc_peer_stub.dart' if (dart.library.html) 'webrtc_peer_web.dart';
+import 'ui/call_screen.dart';
+import 'ui/messenger_home.dart';
+import 'webrtc_peer_stub.dart'
+    if (dart.library.io) 'webrtc_peer_native.dart'
+    if (dart.library.html) 'webrtc_peer_web.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializePlatformServices();
   runApp(const MainApp());
 }
 
@@ -151,7 +161,10 @@ class PeerChatScreen extends StatefulWidget {
 
 class _PeerChatScreenState extends State<PeerChatScreen> {
   final _signalingController = TextEditingController(
-    text: 'ws://127.0.0.1:8787/ws',
+    // Android emulators reach the host machine through 10.0.2.2, not
+    // localhost. This keeps a fresh mobile install connected to the local
+    // Peep engine used during device testing.
+    text: 'ws://10.0.2.2:8787/ws',
   );
   final _roomController = TextEditingController(text: 'demo');
   final _peerController = TextEditingController(
@@ -181,13 +194,30 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   final List<GroupSummary> _groups = [];
   final List<StoredConversation> _recentConversations = [];
   final List<MailboxSummary> _mailboxSummaries = [];
+  final List<CallHistoryEntry> _callHistory = [];
   final List<String> _logs = [];
+  StreamSubscription<String>? _messageNotificationSubscription;
+  String? _pendingNotificationContact;
 
   bool get _isConnected =>
       _status == PeerStatus.signaling ||
       _status == PeerStatus.waitingForPeer ||
       _status == PeerStatus.connecting ||
       _status == PeerStatus.connected;
+
+  bool get _hasOpenConversation => _activeConversationKey != null;
+
+  bool get _canReconnect =>
+      (_status == PeerStatus.disconnected || _status == PeerStatus.failed);
+
+  void _reconnectActiveConversation() {
+    final group = _activeGroup;
+    if (_groupChatActive && group != null) {
+      unawaited(_openGroup(group));
+      return;
+    }
+    unawaited(_connect());
+  }
 
   @override
   void initState() {
@@ -248,12 +278,33 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
         }
       },
     );
+    _messageNotificationSubscription = messageNotificationTaps.listen(
+      _openNotificationChat,
+    );
+    unawaited(_loadInitialNotificationContact());
+  }
+
+  Future<void> _loadInitialNotificationContact() async {
+    final contact = await takeInitialMessageNotificationContact();
+    if (contact != null && contact.isNotEmpty) {
+      await _openNotificationChat(contact);
+    }
+  }
+
+  Future<void> _openNotificationChat(String contact) async {
+    if (_session == null) {
+      _pendingNotificationContact = contact;
+      return;
+    }
+    _contactController.text = contact;
+    await _connect();
   }
 
   @override
   void dispose() {
     _client.disconnect();
     _groupClient.disconnect();
+    _messageNotificationSubscription?.cancel();
     _signalingController.dispose();
     _roomController.dispose();
     _peerController.dispose();
@@ -307,6 +358,11 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       });
       _addLog(successMessage);
       unawaited(_prepareSignedInSession(session));
+      final notificationContact = _pendingNotificationContact;
+      _pendingNotificationContact = null;
+      if (notificationContact != null) {
+        unawaited(_openNotificationChat(notificationContact));
+      }
     } catch (error) {
       _addLog('Account error: $error');
     } finally {
@@ -365,7 +421,9 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
         });
       }
     } catch (error) {
-      setState(() => _status = PeerStatus.failed);
+      if (mounted) {
+        setState(() => _status = PeerStatus.failed);
+      }
       _addLog('Connect failed: $error');
     }
   }
@@ -392,6 +450,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   Future<void> _signOut() async {
     await _client.disconnect();
     await _groupClient.disconnect();
+    await stopMessageNotifications();
     setState(() {
       _groupChatActive = false;
       _activeConversationKey = null;
@@ -401,6 +460,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       _groups.clear();
       _recentConversations.clear();
       _mailboxSummaries.clear();
+      _callHistory.clear();
       _logs.clear();
       _passwordController.clear();
     });
@@ -430,6 +490,15 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   }
 
   Future<void> _prepareSignedInSession(AuthSession session) async {
+    try {
+      await startMessageNotifications(
+        signalingUri: Uri.parse(_signalingController.text.trim()),
+        session: session,
+      );
+      _addLog('Message notifications are ready.');
+    } catch (error) {
+      _addLog('Could not start message notifications: $error');
+    }
     try {
       await ensureIdentityKeyPublished(
         signalingUri: Uri.parse(_signalingController.text.trim()),
@@ -556,7 +625,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     unawaited(_client.setCameraEnabled(!_client.cameraEnabled));
   }
 
-  void _openChatListEntry(_ChatListEntry entry) {
+  void _openChatListEntry(ChatListEntry entry) {
     _contactController.text = entry.contactUsername;
     unawaited(_connect());
   }
@@ -598,7 +667,17 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       );
       return;
     }
+    _callHistory.insert(
+      0,
+      CallHistoryEntry(
+        title: _activeTitle,
+        subtitle: 'Outgoing encrypted call',
+        startedAt: DateTime.now(),
+        outgoing: true,
+      ),
+    );
     _client.startCall();
+    setState(() {});
   }
 
   void _acceptCall() {
@@ -667,10 +746,10 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       ..addAll(listStoredDirectConversations(username));
   }
 
-  List<_ChatListEntry> _chatListEntries() {
-    final entriesByContact = <String, _ChatListEntry>{};
+  List<ChatListEntry> _chatListEntries() {
+    final entriesByContact = <String, ChatListEntry>{};
     for (final conversation in _recentConversations) {
-      entriesByContact[conversation.contactUsername] = _ChatListEntry(
+      entriesByContact[conversation.contactUsername] = ChatListEntry(
         contactUsername: conversation.contactUsername,
         lastText: conversation.lastText,
         updatedAt: conversation.updatedAt,
@@ -680,7 +759,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
 
     for (final summary in _mailboxSummaries) {
       final existing = entriesByContact[summary.contactUsername];
-      entriesByContact[summary.contactUsername] = _ChatListEntry(
+      entriesByContact[summary.contactUsername] = ChatListEntry(
         contactUsername: summary.contactUsername,
         lastText: summary.unreadCount == 1
             ? 'New encrypted message'
@@ -719,7 +798,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
           builder: (context, constraints) {
             final colorScheme = Theme.of(context).colorScheme;
             final wide = constraints.maxWidth >= 860;
-            if (!_isConnected) {
+            if (!_hasOpenConversation) {
               if (_session == null) {
                 return SingleChildScrollView(
                   padding: EdgeInsets.all(wide ? 32 : 16),
@@ -741,7 +820,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
                 );
               }
 
-              return _ContactPanel(
+              return MessengerHome(
                 signalingController: _signalingController,
                 contactController: _contactController,
                 groupNameController: _groupNameController,
@@ -749,6 +828,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
                 session: _session!,
                 chatEntries: _chatListEntries(),
                 groups: _groups,
+                callHistory: _callHistory,
                 connecting:
                     _status == PeerStatus.signaling ||
                     _status == PeerStatus.waitingForPeer ||
@@ -781,6 +861,34 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
             final activeScreenShareEnabled = _groupChatActive
                 ? _groupClient.screenShareEnabled
                 : _client.screenShareEnabled;
+            if (activeCallState != CallState.idle) {
+              return CallScreen(
+                title: _activeTitle,
+                subtitle: _activeSubtitle,
+                callState: activeCallState,
+                connected: _isConnected,
+                cameraEnabled: activeCameraEnabled,
+                microphoneEnabled: activeMicrophoneEnabled,
+                screenShareEnabled: activeScreenShareEnabled,
+                localVideoViewType: _groupChatActive
+                    ? _groupClient.localVideoViewType
+                    : _client.localVideoViewType,
+                remoteVideoViews: _groupChatActive
+                    ? _groupClient.remoteVideoViews
+                    : [
+                        MediaView(
+                          title: _activeTitle,
+                          viewType: _client.remoteVideoViewType,
+                        ),
+                      ],
+                onAccept: _acceptCall,
+                onDecline: _declineCall,
+                onEnd: _endCall,
+                onToggleCamera: _toggleCamera,
+                onToggleMicrophone: _toggleMicrophone,
+                onToggleScreenShare: _toggleScreenShare,
+              );
+            }
             final chatHeader = _ChatHeader(
               room: _activeTitle,
               peer: _activeSubtitle,
@@ -794,38 +902,20 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
                   : _client.encryptionReady,
               callState: activeCallState,
               callsAvailable: true,
+              canReconnect: _canReconnect,
               onBack: _disconnect,
+              onReconnect: _reconnectActiveConversation,
               onStartCall: _startCall,
               onEndCall: _endCall,
               onToggleCamera: _toggleCamera,
               onToggleMicrophone: _toggleMicrophone,
               onToggleScreenShare: _toggleScreenShare,
             );
-            final callNotice = _CallNotice(
-              callState: activeCallState,
-              onAccept: _acceptCall,
-              onDecline: _declineCall,
-              onEnd: _endCall,
-            );
-            final call = _CallPanel(
-              localVideoViewType: _groupChatActive
-                  ? _groupClient.localVideoViewType
-                  : _client.localVideoViewType,
-              remoteVideoViews: _groupChatActive
-                  ? _groupClient.remoteVideoViews
-                  : [
-                      MediaView(
-                        title: 'Remote',
-                        viewType: _client.remoteVideoViewType,
-                      ),
-                    ],
-              connected: _isConnected,
-            );
             final chat = _ChatPanel(
               messages: _messages,
               scrollController: _scrollController,
               messageController: _messageController,
-              canType: _isConnected,
+              canType: _hasOpenConversation,
               canSend: _groupChatActive
                   ? _groupClient.canSend
                   : _client.canMessage,
@@ -842,15 +932,6 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
                   child: Column(
                     children: [
                       chatHeader,
-                      if (activeCallState == CallState.incoming ||
-                          activeCallState == CallState.outgoing) ...[
-                        const SizedBox(height: 12),
-                        callNotice,
-                      ],
-                      if (activeCallState == CallState.active) ...[
-                        const SizedBox(height: 12),
-                        SizedBox(height: wide ? 320 : 260, child: call),
-                      ],
                       const SizedBox(height: 12),
                       Expanded(child: chat),
                     ],
@@ -908,7 +989,9 @@ class _ChatHeader extends StatelessWidget {
     required this.encryptionReady,
     required this.callState,
     required this.callsAvailable,
+    required this.canReconnect,
     required this.onBack,
+    required this.onReconnect,
     required this.onStartCall,
     required this.onEndCall,
     required this.onToggleCamera,
@@ -926,7 +1009,9 @@ class _ChatHeader extends StatelessWidget {
   final bool encryptionReady;
   final CallState callState;
   final bool callsAvailable;
+  final bool canReconnect;
   final VoidCallback onBack;
+  final VoidCallback onReconnect;
   final VoidCallback onStartCall;
   final VoidCallback onEndCall;
   final VoidCallback onToggleCamera;
@@ -989,6 +1074,14 @@ class _ChatHeader extends StatelessWidget {
       ),
     );
     final callControls = <Widget>[
+      if (canReconnect) ...[
+        _RoundActionButton(
+          onPressed: onReconnect,
+          icon: Icons.refresh_rounded,
+          tooltip: 'Reconnect chat',
+        ),
+        const SizedBox(width: 8),
+      ],
       if (callsAvailable && callState == CallState.active) ...[
         _RoundActionButton(
           onPressed: onToggleMicrophone,
@@ -1419,7 +1512,7 @@ class _VideoTile extends StatelessWidget {
                       style: const TextStyle(color: Color(0xffcbd5e1)),
                     ),
                   )
-                : HtmlElementView(viewType: viewType!),
+                : buildPlatformMediaView(viewType!),
           ),
           Positioned(
             left: 10,
@@ -1911,6 +2004,389 @@ class _BrandLockup extends StatelessWidget {
   }
 }
 
+/* Legacy inline messenger shell retained only for migration reference.
+ * Active reusable implementation: ui/messenger_home.dart.
+class _LegacyHome extends StatefulWidget {
+  const _LegacyHome({
+    required this.signalingController,
+    required this.contactController,
+    required this.groupNameController,
+    required this.groupMembersController,
+    required this.session,
+    required this.chatEntries,
+    required this.groups,
+    required this.callHistory,
+    required this.connecting,
+    required this.groupsBusy,
+    required this.onConnect,
+    required this.onOpenChatEntry,
+    required this.onCreateGroup,
+    required this.onOpenGroup,
+    required this.onRefreshGroups,
+    required this.onSignOut,
+    required this.logs,
+  });
+
+  final TextEditingController signalingController;
+  final TextEditingController contactController;
+  final TextEditingController groupNameController;
+  final TextEditingController groupMembersController;
+  final AuthSession session;
+  final List<_ChatListEntry> chatEntries;
+  final List<GroupSummary> groups;
+  final List<_CallHistoryEntry> callHistory;
+  final bool connecting;
+  final bool groupsBusy;
+  final VoidCallback onConnect;
+  final void Function(_ChatListEntry entry) onOpenChatEntry;
+  final VoidCallback onCreateGroup;
+  final void Function(GroupSummary group) onOpenGroup;
+  final VoidCallback onRefreshGroups;
+  final VoidCallback onSignOut;
+  final List<String> logs;
+
+  @override
+  State<_LegacyHome> createState() => _LegacyHomeState();
+}
+
+class _LegacyHomeState extends State<_LegacyHome> {
+  int _tabIndex = 0;
+
+  void _showNewChat() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _ActionDialog(
+        icon: Icons.edit_square,
+        title: 'New message',
+        description: 'Enter a Peep username to start a private conversation.',
+        primaryLabel: widget.connecting ? 'Connecting…' : 'Next',
+        primaryEnabled: !widget.connecting,
+        onPrimary: () {
+          Navigator.of(dialogContext).pop();
+          widget.onConnect();
+        },
+        child: TextField(
+          controller: widget.contactController,
+          autofocus: true,
+          enabled: !widget.connecting,
+          textInputAction: TextInputAction.done,
+          onSubmitted: widget.connecting
+              ? null
+              : (_) {
+                  Navigator.of(dialogContext).pop();
+                  widget.onConnect();
+                },
+          decoration: const InputDecoration(
+            labelText: 'Username',
+            hintText: 'e.g. alex',
+            prefixIcon: Icon(Icons.alternate_email_rounded),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showNewGroup() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _ActionDialog(
+        icon: Icons.group_add_rounded,
+        title: 'New group',
+        description: 'Create a private group conversation.',
+        primaryLabel: widget.groupsBusy ? 'Creating…' : 'Create',
+        primaryEnabled: !widget.groupsBusy,
+        onPrimary: () {
+          Navigator.of(dialogContext).pop();
+          widget.onCreateGroup();
+        },
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: widget.groupNameController,
+              autofocus: true,
+              enabled: !widget.groupsBusy,
+              textInputAction: TextInputAction.next,
+              decoration: const InputDecoration(
+                labelText: 'Group name',
+                prefixIcon: Icon(Icons.groups_outlined),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: widget.groupMembersController,
+              enabled: !widget.groupsBusy,
+              minLines: 2,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Member usernames',
+                hintText: 'alex, maya, sam',
+                helperText: 'Separate usernames with commas',
+                prefixIcon: Icon(Icons.alternate_email_rounded),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showComposeSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const CircleAvatar(child: Icon(Icons.person_add_alt_1)),
+                title: const Text('New message'),
+                subtitle: const Text('Start a private conversation'),
+                onTap: widget.connecting
+                    ? null
+                    : () {
+                        Navigator.of(sheetContext).pop();
+                        Future<void>.delayed(
+                          Duration.zero,
+                          _showNewChat,
+                        );
+                      },
+              ),
+              ListTile(
+                leading: const CircleAvatar(child: Icon(Icons.group_add)),
+                title: const Text('New group'),
+                subtitle: const Text('Create an encrypted group'),
+                onTap: widget.groupsBusy
+                    ? null
+                    : () {
+                        Navigator.of(sheetContext).pop();
+                        Future<void>.delayed(
+                          Duration.zero,
+                          _showNewGroup,
+                        );
+                      },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showConnectionSettings() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _ActionDialog(
+        icon: Icons.hub_outlined,
+        title: 'Connection settings',
+        description: 'Configure the secure signaling endpoint used by Peep.',
+        primaryLabel: 'Done',
+        onPrimary: () => Navigator.of(dialogContext).pop(),
+        child: TextField(
+          controller: widget.signalingController,
+          keyboardType: TextInputType.url,
+          decoration: const InputDecoration(
+            labelText: 'Signaling server URL',
+            prefixIcon: Icon(Icons.dns_outlined),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInbox() {
+    final hasItems = widget.chatEntries.isNotEmpty || widget.groups.isNotEmpty;
+    return RefreshIndicator(
+      onRefresh: () async => widget.onRefreshGroups(),
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 104),
+        children: [
+          if (widget.connecting)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          if (!hasItems)
+            const Padding(
+              padding: EdgeInsets.only(top: 88),
+              child: _LegacyEmptyState(
+                icon: Icons.markunread_outlined,
+                title: 'No messages yet',
+                message: 'Start a new message to begin a private conversation.',
+              ),
+            ),
+          for (final entry in widget.chatEntries)
+            _LegacyConversationTile.direct(
+              entry: entry,
+              enabled: !widget.connecting,
+              onTap: () => widget.onOpenChatEntry(entry),
+            ),
+          for (final group in widget.groups)
+            _LegacyConversationTile.group(
+              group: group,
+              enabled: !widget.groupsBusy,
+              onTap: () => widget.onOpenGroup(group),
+            ),
+          if (widget.groupsBusy && widget.groups.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCalls() {
+    if (widget.callHistory.isEmpty) {
+      return const _LegacyEmptyState(
+        icon: Icons.call_outlined,
+        title: 'No calls yet',
+        message: 'Calls you make or receive will appear here.',
+      );
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+      itemCount: widget.callHistory.length,
+      separatorBuilder: (_, _) => const Divider(indent: 72),
+      itemBuilder: (context, index) {
+        final call = widget.callHistory[index];
+        return ListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          leading: _InitialAvatar(label: call.title),
+          title: Text(call.title, style: const TextStyle(fontWeight: FontWeight.w700)),
+          subtitle: Text('${call.subtitle}  •  ${_compactTime(call.startedAt)}'),
+          trailing: Icon(
+            call.outgoing ? Icons.call_made_rounded : Icons.call_received_rounded,
+            color: _Ui.primary,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSettings() {
+    final username = widget.session.username;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 16, 12, 24),
+      children: [
+        ListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          leading: _InitialAvatar(label: username),
+          title: Text('@$username', style: const TextStyle(fontWeight: FontWeight.w800)),
+          subtitle: Text(widget.session.email),
+        ),
+        const SizedBox(height: 8),
+        const Divider(),
+        const _SettingsRow(icon: Icons.person_outline, title: 'Account'),
+        const _SettingsRow(icon: Icons.lock_outline, title: 'Privacy'),
+        const _SettingsRow(icon: Icons.palette_outlined, title: 'Appearance'),
+        _SettingsRow(
+          icon: Icons.hub_outlined,
+          title: 'Connection settings',
+          onTap: _showConnectionSettings,
+        ),
+        _SettingsRow(
+          icon: Icons.info_outline,
+          title: 'Connection activity',
+          onTap: () => showDialog<void>(
+            context: context,
+            builder: (dialogContext) => _ActionDialog(
+              icon: Icons.terminal_rounded,
+              title: 'Connection activity',
+              description: 'Session diagnostics for troubleshooting.',
+              primaryLabel: 'Done',
+              onPrimary: () => Navigator.of(dialogContext).pop(),
+              child: _EventLog(widget.logs),
+            ),
+          ),
+        ),
+        const Divider(),
+        _SettingsRow(
+          icon: Icons.logout_rounded,
+          title: 'Sign out',
+          destructive: true,
+          onTap: widget.connecting ? null : widget.onSignOut,
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final titles = ['Chats', 'Calls', 'Settings'];
+    final body = switch (_tabIndex) {
+      0 => _buildInbox(),
+      1 => _buildCalls(),
+      _ => _buildSettings(),
+    };
+
+    return Material(
+      color: const Color(0xfff7f7f8),
+      child: Column(
+        children: [
+          Container(
+            height: 64,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            color: Colors.white,
+            child: Row(
+              children: [
+                Text(
+                  titles[_tabIndex],
+                  style: const TextStyle(
+                    color: _Ui.ink,
+                    fontSize: 26,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const Spacer(),
+                if (_tabIndex == 0)
+                  IconButton(
+                    tooltip: 'New message',
+                    onPressed: widget.connecting ? null : _showNewChat,
+                    icon: const Icon(Icons.edit_square),
+                  ),
+                IconButton(
+                  tooltip: 'More options',
+                  onPressed: _showComposeSheet,
+                  icon: const Icon(Icons.more_vert),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(child: body),
+          NavigationBar(
+            selectedIndex: _tabIndex,
+            onDestinationSelected: (index) => setState(() => _tabIndex = index),
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.chat_bubble_outline),
+                selectedIcon: Icon(Icons.chat_bubble),
+                label: 'Chats',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.call_outlined),
+                selectedIcon: Icon(Icons.call),
+                label: 'Calls',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.person_outline),
+                selectedIcon: Icon(Icons.person),
+                label: 'Settings',
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+*/
 class _ContactPanel extends StatelessWidget {
   const _ContactPanel({
     required this.signalingController,
@@ -3705,7 +4181,7 @@ class _AttachmentBubble extends StatelessWidget {
             child: SizedBox(
               width: 460,
               height: mediaHeight,
-              child: HtmlElementView(viewType: attachment.viewType!),
+              child: buildPlatformMediaView(attachment.viewType!),
             ),
           ),
         ],

@@ -8,6 +8,24 @@ import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
+import 'package:flutter/widgets.dart';
+
+Future<void> initializePlatformServices() async {}
+
+Future<void> startMessageNotifications({
+  required Uri signalingUri,
+  required AuthSession session,
+}) async {}
+
+Future<void> stopMessageNotifications() async {}
+
+Stream<String> get messageNotificationTaps => const Stream.empty();
+Future<String?> takeInitialMessageNotificationContact() async => null;
+
+Widget buildPlatformMediaView(String viewType) {
+  return HtmlElementView(viewType: viewType);
+}
+
 enum PeerStatus {
   idle,
   signaling,
@@ -1569,6 +1587,9 @@ class PeerClient {
   final Map<String, _IncomingAttachment> _incomingAttachments = {};
   JSAny? _privateKey;
   JSAny? _aesKey;
+  String? _e2eePublicKey;
+  Map<String, dynamic>? _pendingEncryptionKey;
+  bool _encryptionHandshakeStarted = false;
   String? _roomKeyStorageKey;
   bool _remoteDescriptionSet = false;
   bool _offerStarted = false;
@@ -1579,7 +1600,8 @@ class PeerClient {
   CallState _callState = CallState.idle;
   static int _nextViewId = 0;
   static int _nextAttachmentId = 0;
-  static const int _attachmentChunkSize = 16 * 1024;
+  // Keep encrypted JSON envelopes below mobile WebRTC/SCTP message limits.
+  static const int _attachmentChunkSize = 4 * 1024;
 
   bool get canSend => _dataChannel?.readyState == 'open';
   bool get canStoreOffline =>
@@ -1645,6 +1667,9 @@ class PeerClient {
     _incomingAttachments.clear();
     _privateKey = null;
     _aesKey = null;
+    _pendingEncryptionKey = null;
+    _encryptionHandshakeStarted = false;
+    _e2eePublicKey = null;
     final effectiveRoom = accountUsername != null && contactUsername != null
         ? _directRoom(accountUsername, contactUsername)
         : room.trim();
@@ -1755,10 +1780,11 @@ class PeerClient {
     }
 
     try {
-      await _startLocalMedia(audio: true, video: false);
       _callState = CallState.active;
-      _sendControl({'kind': 'call-accept'});
-      onLog('Call accepted.');
+      // Send acceptance before media renegotiation so the caller can start
+      // the offer/answer exchange from the established data channel.
+      await _sendControl({'kind': 'call-accept'});
+      onLog('Call accepted. Waiting for caller media offer.');
       onMediaChanged();
     } catch (error) {
       _callState = CallState.idle;
@@ -1939,6 +1965,9 @@ class PeerClient {
     _incomingAttachments.clear();
     _privateKey = null;
     _aesKey = null;
+    _pendingEncryptionKey = null;
+    _encryptionHandshakeStarted = false;
+    _e2eePublicKey = null;
     _roomKeyStorageKey = null;
     onStatus(PeerStatus.disconnected);
     onMediaChanged();
@@ -2425,6 +2454,10 @@ class PeerClient {
   }
 
   Future<void> _startEncryptionHandshake() async {
+    if (_encryptionHandshakeStarted) {
+      return;
+    }
+    _encryptionHandshakeStarted = true;
     final subtle = _subtleCrypto;
     final keyPair = await subtle
         .callMethod<JSPromise<JSObject>>(
@@ -2447,16 +2480,48 @@ class PeerClient {
           publicKey,
         )
         .toDart;
-    _sendPlainDataChannel({
-      'kind': 'e2ee-key',
-      'publicKey': base64Encode(publicBytes.toDart.asUint8List()),
-    });
+    _e2eePublicKey = base64Encode(publicBytes.toDart.asUint8List());
+    _sendE2eePublicKey();
     onLog('E2EE key sent.');
+    _retryE2eePublicKey(_e2eePublicKey!);
+
+    final pendingKey = _pendingEncryptionKey;
+    _pendingEncryptionKey = null;
+    if (pendingKey != null) {
+      await _handleEncryptionKey(pendingKey);
+    }
+  }
+
+  void _sendE2eePublicKey() {
+    final publicKey = _e2eePublicKey;
+    if (publicKey == null) return;
+    _sendPlainDataChannel({'kind': 'e2ee-key', 'publicKey': publicKey});
+  }
+
+  void _retryE2eePublicKey(String publicKey) {
+    for (final delay in const [
+      Duration(milliseconds: 250),
+      Duration(milliseconds: 750),
+      Duration(milliseconds: 1500),
+    ]) {
+      unawaited(
+        Future<void>.delayed(delay, () {
+          if (!_closed && _e2eePublicKey == publicKey) {
+            _sendE2eePublicKey();
+          }
+        }),
+      );
+    }
   }
 
   Future<void> _handleEncryptionKey(Map<String, dynamic> message) async {
     final publicKey = message['publicKey'];
-    if (publicKey is! String || _privateKey == null) {
+    if (publicKey is! String || _aesKey != null) {
+      return;
+    }
+    if (_privateKey == null) {
+      _pendingEncryptionKey = Map<String, dynamic>.from(message);
+      onLog('Received E2EE key before local key generation completed.');
       return;
     }
 
@@ -2485,6 +2550,7 @@ class PeerClient {
       ],
     ).toDart;
     await _persistRoomKey();
+    _sendE2eePublicKey();
     onLog('E2EE ready.');
     onMediaChanged();
     unawaited(_flushPendingEncryptedPayloads());
@@ -2749,6 +2815,19 @@ class PeerClient {
     });
     _remoteDescriptionSet = true;
     await _flushPendingCandidates();
+
+    if (_callState == CallState.active &&
+        _localStream?.getAudioTracks().isEmpty != false) {
+      try {
+        await _startLocalMedia(audio: true, video: false);
+      } catch (error) {
+        _callState = CallState.idle;
+        await _sendControl({'kind': 'call-end'});
+        onLog('Could not start microphone: $error');
+        onMediaChanged();
+        return;
+      }
+    }
 
     final answer = await _createDescription('createAnswer');
     await _setLocalDescription(answer);
