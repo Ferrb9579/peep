@@ -45,12 +45,24 @@ pub fn header_value(request: &str, name: &str) -> Option<String> {
     })
 }
 
-pub fn parse_query(request: &str) -> (String, String) {
-    let path = request
+pub fn request_method(request: &str) -> &str {
+    request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default()
+}
+
+pub fn request_path(request: &str) -> &str {
+    request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/ws");
+        .unwrap_or("/")
+}
+
+pub fn parse_query(request: &str) -> (String, String) {
+    let path = request_path(request);
 
     let query = path
         .split_once('?')
@@ -72,6 +84,19 @@ pub fn parse_query(request: &str) -> (String, String) {
     }
 
     (room, peer)
+}
+
+pub fn query_param(request: &str, name: &str) -> Option<String> {
+    let path = request_path(request);
+    let query = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default();
+
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name && !value.is_empty()).then(|| percent_decode(value))
+    })
 }
 
 pub fn websocket_accept_key(key: &str) -> String {

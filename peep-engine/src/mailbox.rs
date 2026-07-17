@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -6,6 +7,7 @@ use std::{
 };
 
 use rusqlite::{Connection, params};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 const DEFAULT_MAILBOX_PATH: &str = "peep-mailboxes.sqlite3";
@@ -16,12 +18,20 @@ pub struct MailboxStore {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MailboxSummary {
+    pub room: String,
+    #[serde(rename = "contactUsername")]
+    pub contact_username: String,
+    #[serde(rename = "unreadCount")]
+    pub unread_count: i64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+}
+
 impl MailboxStore {
     pub fn open_from_env() -> io::Result<Self> {
-        let path = std::env::var("PEEP_MAILBOX_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_MAILBOX_PATH));
-        Self::open(path)
+        Self::open(database_path_from_env())
     }
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -149,6 +159,90 @@ impl MailboxStore {
             })
             .collect()
     }
+
+    pub fn list_for_peer(&self, peer: &str) -> io::Result<Vec<MailboxSummary>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "\
+                SELECT room, sender, COUNT(*) AS unread_count, MAX(created_at) AS updated_at
+                FROM mailbox_messages
+                WHERE sender != ?1
+                  AND room LIKE 'dm:%'
+                GROUP BY room, sender
+                ",
+            )
+            .map_err(to_io_error)?;
+
+        let rows = statement
+            .query_map(params![peer], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(to_io_error)?;
+
+        let mut summaries_by_contact = HashMap::<String, MailboxSummary>::new();
+        for row in rows {
+            let (room, sender, unread_count, updated_at) = row.map_err(to_io_error)?;
+            let Some(contact_username) = direct_room_contact(&room, peer) else {
+                continue;
+            };
+            if contact_username != sender {
+                continue;
+            }
+
+            summaries_by_contact
+                .entry(contact_username.clone())
+                .and_modify(|summary| {
+                    summary.unread_count += unread_count;
+                    if updated_at > summary.updated_at {
+                        summary.updated_at = updated_at;
+                        summary.room = room.clone();
+                    }
+                })
+                .or_insert(MailboxSummary {
+                    room,
+                    contact_username,
+                    unread_count,
+                    updated_at,
+                });
+        }
+
+        let mut summaries = summaries_by_contact.into_values().collect::<Vec<_>>();
+        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(summaries)
+    }
+}
+
+fn direct_room_contact(room: &str, peer: &str) -> Option<String> {
+    let mut parts = room.split(':');
+    if parts.next()? != "dm" {
+        return None;
+    }
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if first == peer {
+        Some(second.to_string())
+    } else if second == peer {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn database_path_from_env() -> PathBuf {
+    std::env::var("PEEP_MAILBOX_PATH")
+        .or_else(|_| std::env::var("PEEP_DB_PATH"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_MAILBOX_PATH))
 }
 
 fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
