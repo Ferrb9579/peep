@@ -10,6 +10,8 @@ import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/widgets.dart';
 
+import 'storage/encrypted_store.dart';
+
 Future<void> initializePlatformServices() async {}
 
 Future<void> startMessageNotifications({
@@ -592,8 +594,10 @@ class MailboxSummary {
   }
 }
 
-List<ChatMessage> loadMessageHistory(String conversationKey) {
-  final raw = html.window.localStorage[_historyStorageKey(conversationKey)];
+Future<List<ChatMessage>> loadMessageHistory(String conversationKey) async {
+  final raw = await EncryptedStore.instance.read(
+    _historyStorageKey(conversationKey),
+  );
   if (raw == null || raw.isEmpty) {
     return const [];
   }
@@ -613,7 +617,10 @@ List<ChatMessage> loadMessageHistory(String conversationKey) {
   }
 }
 
-void saveMessageHistory(String conversationKey, List<ChatMessage> messages) {
+Future<void> saveMessageHistory(
+  String conversationKey,
+  List<ChatMessage> messages,
+) async {
   final storageKey = _historyStorageKey(conversationKey);
   var cappedMessages = messages.length > _maxStoredMessages
       ? messages.sublist(messages.length - _maxStoredMessages)
@@ -621,8 +628,9 @@ void saveMessageHistory(String conversationKey, List<ChatMessage> messages) {
 
   while (cappedMessages.isNotEmpty) {
     try {
-      html.window.localStorage[storageKey] = jsonEncode(
-        cappedMessages.map(_messageToJson).toList(growable: false),
+      await EncryptedStore.instance.write(
+        storageKey,
+        jsonEncode(cappedMessages.map(_messageToJson).toList(growable: false)),
       );
       return;
     } catch (_) {
@@ -633,13 +641,16 @@ void saveMessageHistory(String conversationKey, List<ChatMessage> messages) {
     }
   }
 
-  html.window.localStorage.remove(storageKey);
+  await EncryptedStore.instance.delete(storageKey);
 }
 
-List<StoredConversation> listStoredDirectConversations(String username) {
+Future<List<StoredConversation>> listStoredDirectConversations(
+  String username,
+) async {
   final normalizedUsername = username.trim().toLowerCase();
   final conversations = <StoredConversation>[];
-  for (final storageKey in html.window.localStorage.keys) {
+  final records = await EncryptedStore.instance.readAll();
+  for (final storageKey in records.keys) {
     if (!storageKey.startsWith(_historyStoragePrefix)) {
       continue;
     }
@@ -655,7 +666,7 @@ List<StoredConversation> listStoredDirectConversations(String username) {
       continue;
     }
 
-    final messages = loadMessageHistory(conversationKey);
+    final messages = await loadMessageHistory(conversationKey);
     if (messages.isEmpty) {
       continue;
     }

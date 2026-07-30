@@ -354,8 +354,8 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       setState(() {
         _session = session;
         _peerController.text = session.username;
-        _refreshRecentConversations(session.username);
       });
+      unawaited(_refreshRecentConversations(session.username));
       _addLog(successMessage);
       unawaited(_prepareSignedInSession(session));
       final notificationContact = _pendingNotificationContact;
@@ -392,7 +392,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     try {
       await _groupClient.disconnect();
       final conversationKey = _directRoom(session.username, contact);
-      final history = loadMessageHistory(conversationKey);
+      final history = await loadMessageHistory(conversationKey);
       _roomController.text = conversationKey;
       _peerController.text = session.username;
       setState(() {
@@ -443,7 +443,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     final session = _session;
     if (session != null) {
       await _loadMailboxSummaries(session);
-      setState(() => _refreshRecentConversations(session.username));
+      await _refreshRecentConversations(session.username);
     }
   }
 
@@ -511,7 +511,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     await _loadGroups(session);
     await _loadMailboxSummaries(session);
     if (mounted) {
-      setState(() => _refreshRecentConversations(session.username));
+      await _refreshRecentConversations(session.username);
     }
   }
 
@@ -587,7 +587,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
 
     FocusScope.of(context).unfocus();
     final conversationKey = 'group:${group.id}';
-    final history = loadMessageHistory(conversationKey);
+    final history = await loadMessageHistory(conversationKey);
     try {
       final groupKeyBase64 = await loadOrFetchGroupKey(
         signalingUri: Uri.parse(_signalingController.text.trim()),
@@ -733,17 +733,21 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
       return;
     }
 
-    saveMessageHistory(conversationKey, _messages);
+    unawaited(saveMessageHistory(conversationKey, _messages));
     final session = _session;
     if (session != null) {
-      _refreshRecentConversations(session.username);
+      unawaited(_refreshRecentConversations(session.username));
     }
   }
 
-  void _refreshRecentConversations(String username) {
-    _recentConversations
-      ..clear()
-      ..addAll(listStoredDirectConversations(username));
+  Future<void> _refreshRecentConversations(String username) async {
+    final conversations = await listStoredDirectConversations(username);
+    if (!mounted) return;
+    setState(() {
+      _recentConversations
+        ..clear()
+        ..addAll(conversations);
+    });
   }
 
   List<ChatListEntry> _chatListEntries() {

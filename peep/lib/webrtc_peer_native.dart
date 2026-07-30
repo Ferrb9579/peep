@@ -21,6 +21,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'storage/encrypted_store.dart';
+
 late SharedPreferencesWithCache _preferences;
 final Map<String, RTCVideoRenderer> _videoRenderers = {};
 final Map<String, AttachmentData> _attachmentViews = {};
@@ -30,6 +32,7 @@ Future<void> initializePlatformServices() async {
   _preferences = await SharedPreferencesWithCache.create(
     cacheOptions: const SharedPreferencesWithCacheOptions(),
   );
+  await _migrateLegacyMessageHistory();
   _messageNotificationChannel.setMethodCallHandler((call) async {
     if (call.method == 'openChat') {
       final arguments = call.arguments;
@@ -38,6 +41,20 @@ Future<void> initializePlatformServices() async {
       }
     }
   });
+}
+
+Future<void> _migrateLegacyMessageHistory() async {
+  for (final key in _preferences.keys) {
+    if (!key.startsWith(_historyStoragePrefix)) continue;
+    final legacyValue = _preferences.getString(key);
+    if (legacyValue != null && legacyValue.isNotEmpty) {
+      final encryptedValue = await EncryptedStore.instance.read(key);
+      if (encryptedValue == null || encryptedValue.isEmpty) {
+        await EncryptedStore.instance.write(key, legacyValue);
+      }
+    }
+    await _preferences.remove(key);
+  }
 }
 
 const _messageNotificationChannel = MethodChannel('peep/message_notifications');
@@ -706,8 +723,10 @@ String _historyStorageKey(String key) =>
     '$_historyStoragePrefix${key.trim().toLowerCase()}';
 String _groupKeyStorageKey(String groupId) => 'peep:group-key:$groupId';
 
-List<ChatMessage> loadMessageHistory(String conversationKey) {
-  final raw = _preferences.getString(_historyStorageKey(conversationKey));
+Future<List<ChatMessage>> loadMessageHistory(String conversationKey) async {
+  final raw = await EncryptedStore.instance.read(
+    _historyStorageKey(conversationKey),
+  );
   if (raw == null || raw.isEmpty) return const [];
   try {
     final decoded = jsonDecode(raw);
@@ -722,37 +741,41 @@ List<ChatMessage> loadMessageHistory(String conversationKey) {
   }
 }
 
-void saveMessageHistory(String conversationKey, List<ChatMessage> messages) {
+Future<void> saveMessageHistory(
+  String conversationKey,
+  List<ChatMessage> messages,
+) async {
   var capped = messages.length > _maxStoredMessages
       ? messages.sublist(messages.length - _maxStoredMessages)
       : List<ChatMessage>.from(messages);
   final storageKey = _historyStorageKey(conversationKey);
   while (capped.isNotEmpty) {
     try {
-      unawaited(
-        _preferences.setString(
-          storageKey,
-          jsonEncode(capped.map(_messageToJson).toList(growable: false)),
-        ),
+      await EncryptedStore.instance.write(
+        storageKey,
+        jsonEncode(capped.map(_messageToJson).toList(growable: false)),
       );
       return;
     } catch (_) {
       capped = capped.sublist(capped.length < 20 ? 1 : capped.length ~/ 4);
     }
   }
-  unawaited(_preferences.remove(storageKey));
+  await EncryptedStore.instance.delete(storageKey);
 }
 
-List<StoredConversation> listStoredDirectConversations(String username) {
+Future<List<StoredConversation>> listStoredDirectConversations(
+  String username,
+) async {
   final normalized = username.trim().toLowerCase();
   final conversations = <StoredConversation>[];
-  for (final storageKey in _preferences.keys) {
+  final records = await EncryptedStore.instance.readAll();
+  for (final storageKey in records.keys) {
     if (!storageKey.startsWith(_historyStoragePrefix)) continue;
     final key = storageKey.substring(_historyStoragePrefix.length);
     final parts = key.split(':');
     if (parts.length != 3 || parts.first != 'dm') continue;
     if (parts[1] != normalized && parts[2] != normalized) continue;
-    final messages = loadMessageHistory(key);
+    final messages = await loadMessageHistory(key);
     if (messages.isEmpty) continue;
     final last = messages.last;
     conversations.add(

@@ -194,13 +194,18 @@ class MailboxSummary {
   final DateTime updatedAt;
 }
 
-List<ChatMessage> loadMessageHistory(String conversationKey) {
+Future<List<ChatMessage>> loadMessageHistory(String conversationKey) async {
   return const [];
 }
 
-void saveMessageHistory(String conversationKey, List<ChatMessage> messages) {}
+Future<void> saveMessageHistory(
+  String conversationKey,
+  List<ChatMessage> messages,
+) async {}
 
-List<StoredConversation> listStoredDirectConversations(String username) {
+Future<List<StoredConversation>> listStoredDirectConversations(
+  String username,
+) async {
   return const [];
 }
 
