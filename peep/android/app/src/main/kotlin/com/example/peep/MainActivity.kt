@@ -81,6 +81,33 @@ class MainActivity : FlutterActivity() {
                     result.success(pendingNotificationContact)
                     pendingNotificationContact = null
                 }
+                "cacheConversationKey" -> {
+                    val contact = call.argument<String>("contact")
+                    val key = call.argument<String>("key")
+                    if (contact.isNullOrBlank() || key.isNullOrBlank()) {
+                        result.error("invalid_arguments", "A contact and conversation key are required.", null)
+                    } else {
+                        MessageNotificationService.cacheConversationKey(this, contact, key)
+                        result.success(null)
+                    }
+                }
+                "showIncomingMessage" -> {
+                    val contact = call.argument<String>("contact")
+                    val preview = call.argument<String>("preview")
+                    if (contact.isNullOrBlank() || preview.isNullOrBlank()) {
+                        result.error("invalid_arguments", "A contact and message preview are required.", null)
+                    } else {
+                        ContextCompat.startForegroundService(
+                            this,
+                            Intent(this, MessageNotificationService::class.java).apply {
+                                action = MessageNotificationService.ACTION_SHOW_INCOMING
+                                putExtra(MessageNotificationService.EXTRA_CONTACT, contact)
+                                putExtra(MessageNotificationService.EXTRA_PREVIEW, preview)
+                            },
+                        )
+                        result.success(null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }

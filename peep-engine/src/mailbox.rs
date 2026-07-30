@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -215,6 +215,37 @@ impl MailboxStore {
         let mut summaries = summaries_by_contact.into_values().collect::<Vec<_>>();
         summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(summaries)
+    }
+
+    /// Returns the newest opaque payload for a direct conversation without
+    /// marking it read. The authenticated device is the only caller that can
+    /// decrypt this value; the server still never sees plaintext.
+    pub fn latest_for_peer_contact(&self, peer: &str, contact: &str) -> io::Result<Option<Value>> {
+        let room = direct_room(peer, contact);
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let payload = connection
+            .query_row(
+                "\
+                SELECT payload FROM mailbox_messages
+                WHERE room = ?1 AND sender = ?2
+                ORDER BY id DESC LIMIT 1
+                ",
+                params![room, contact],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(to_io_error)?;
+        payload
+            .map(|value| serde_json::from_str(&value).map_err(to_io_error))
+            .transpose()
+    }
+}
+
+fn direct_room(first: &str, second: &str) -> String {
+    if first <= second {
+        format!("dm:{first}:{second}")
+    } else {
+        format!("dm:{second}:{first}")
     }
 }
 

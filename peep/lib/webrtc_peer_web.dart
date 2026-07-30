@@ -21,6 +21,11 @@ Future<void> startMessageNotifications({
 
 Future<void> stopMessageNotifications() async {}
 
+Future<void> showIncomingMessageNotification({
+  required String contact,
+  required String preview,
+}) async {}
+
 Stream<String> get messageNotificationTaps => const Stream.empty();
 Future<String?> takeInitialMessageNotificationContact() async => null;
 

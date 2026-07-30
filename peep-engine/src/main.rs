@@ -230,9 +230,7 @@ async fn handle_api_request(
     }
 
     match (method, path) {
-        ("GET", "/health") => {
-            write_json_response(&mut stream, 200, json!({"status": "ok"})).await
-        }
+        ("GET", "/health") => write_json_response(&mut stream, 200, json!({"status": "ok"})).await,
         ("POST", "/api/register") => {
             let body = read_json_body(&mut stream, request).await?;
             let email = body
@@ -385,6 +383,32 @@ async fn handle_api_request(
                 Ok(chats) => write_json_response(&mut stream, 200, json!({"chats": chats})).await,
                 Err(error) => {
                     write_json_response(&mut stream, 400, json!({"error": error.to_string()})).await
+                }
+            }
+        }
+        ("POST", "/api/mailbox/peek") => {
+            let body = read_json_body(&mut stream, request).await?;
+            let session = session_from_body(auth, &body)?;
+            let contact = body
+                .get("contact")
+                .and_then(Value::as_str)
+                .map(normalize_username)
+                .transpose()?;
+            match contact {
+                Some(contact) => match mailbox.latest_for_peer_contact(&session.username, &contact)
+                {
+                    Ok(Some(payload)) => {
+                        write_json_response(&mut stream, 200, json!({"payload": payload})).await
+                    }
+                    Ok(None) => write_json_response(&mut stream, 200, json!({})).await,
+                    Err(error) => {
+                        write_json_response(&mut stream, 400, json!({"error": error.to_string()}))
+                            .await
+                    }
+                },
+                None => {
+                    write_json_response(&mut stream, 400, json!({"error": "contact is required"}))
+                        .await
                 }
             }
         }

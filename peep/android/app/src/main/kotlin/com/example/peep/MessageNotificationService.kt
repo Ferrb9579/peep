@@ -11,6 +11,7 @@ import android.content.SharedPreferences
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import okhttp3.MediaType.Companion.toMediaType
@@ -20,9 +21,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import java.net.URI
+import java.security.SecureRandom
+import java.util.Base64
 import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Keeps one authenticated, metadata-only socket alive while the account is
@@ -34,9 +41,15 @@ class MessageNotificationService : Service() {
         private const val LOG_TAG = "PeepNotifications"
         const val ACTION_START = "com.example.peep.notifications.START"
         const val ACTION_STOP = "com.example.peep.notifications.STOP"
+        const val ACTION_REPLY = "com.example.peep.notifications.REPLY"
+        const val ACTION_SHOW_INCOMING = "com.example.peep.notifications.SHOW_INCOMING"
         const val EXTRA_SOCKET_URL = "socket_url"
         const val EXTRA_AUTH_TOKEN = "auth_token"
         const val EXTRA_USERNAME = "username"
+        const val EXTRA_CONTACT = "contact"
+        const val EXTRA_REPLY_TEXT = "reply_text"
+        const val EXTRA_PREVIEW = "preview"
+        const val REMOTE_INPUT_KEY = "peep_inline_reply"
 
         private const val CONNECTION_CHANNEL_ID = "peep_connection"
         private const val MESSAGE_CHANNEL_ID = "peep_messages"
@@ -46,6 +59,27 @@ class MessageNotificationService : Service() {
         private const val SOCKET_URL_KEY = "socket_url"
         private const val AUTH_TOKEN_KEY = "auth_token"
         private const val USERNAME_KEY = "username"
+        private const val CONVERSATION_KEY_PREFIX = "conversation_key:"
+
+        fun cacheConversationKey(context: Context, contact: String, key: String) {
+            if (contact.isBlank() || key.isBlank()) return
+            securePreferences(context).edit()
+                .putString("$CONVERSATION_KEY_PREFIX${contact.lowercase()}", key)
+                .apply()
+        }
+
+        private fun securePreferences(context: Context): SharedPreferences {
+            val key = MasterKey.Builder(context.applicationContext)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            return EncryptedSharedPreferences.create(
+                context.applicationContext,
+                PREFS_FILE,
+                key,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            )
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -78,9 +112,21 @@ class MessageNotificationService : Service() {
                 username = intent.getStringExtra(EXTRA_USERNAME)
                 saveConfiguration()
             }
+            ACTION_REPLY -> restoreConfiguration()
+            ACTION_SHOW_INCOMING -> restoreConfiguration()
             else -> restoreConfiguration()
         }
 
+        if (intent?.action == ACTION_SHOW_INCOMING) {
+            createChannels()
+            startForeground(CONNECTION_NOTIFICATION_ID, connectionNotification())
+            showMessageNotification(
+                intent.getStringExtra(EXTRA_CONTACT).orEmpty(),
+                1,
+                intent.getStringExtra(EXTRA_PREVIEW),
+            )
+            return START_STICKY
+        }
         if (socketUrl.isNullOrBlank() || authToken.isNullOrBlank() || username.isNullOrBlank()) {
             stopSelf()
             return START_NOT_STICKY
@@ -94,6 +140,12 @@ class MessageNotificationService : Service() {
         createChannels()
         startForeground(CONNECTION_NOTIFICATION_ID, connectionNotification())
         connect()
+        if (intent?.action == ACTION_REPLY) {
+            sendInlineReply(
+                intent.getStringExtra(EXTRA_CONTACT).orEmpty(),
+                intent.getStringExtra(EXTRA_REPLY_TEXT).orEmpty(),
+            )
+        }
         return START_STICKY
     }
 
@@ -175,7 +227,7 @@ class MessageNotificationService : Service() {
                                 break
                             }
                         }
-                        showMessageNotification(sender, unreadCount)
+                        fetchMessagePreview(sender, unreadCount)
                         Log.d(LOG_TAG, "Message notification displayed.")
                     }
                 }
@@ -188,6 +240,30 @@ class MessageNotificationService : Service() {
         val scheme = if (source.scheme.equals("wss", ignoreCase = true)) "https" else "http"
         URI(scheme, null, source.host, source.port, "/api/mailbox/list", null, null).toString()
     }.getOrNull()
+
+    private fun fetchMessagePreview(sender: String, unreadCount: Int) {
+        val token = authToken ?: return
+        val endpoint = mailboxEndpoint()?.replace("/api/mailbox/list", "/api/mailbox/peek") ?: return
+        val body = JSONObject().put("token", token).put("contact", sender).toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        client.newCall(Request.Builder().url(endpoint).post(body).build()).enqueue(
+            object : okhttp3.Callback {
+                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                    showMessageNotification(sender, unreadCount, null)
+                }
+
+                override fun onResponse(call: okhttp3.Call, response: Response) {
+                    response.use {
+                        val root = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
+                        val preview = root?.optJSONObject("payload")?.let { payload ->
+                            decryptMessagePreview(sender, payload)
+                        }
+                        showMessageNotification(sender, unreadCount, preview)
+                    }
+                }
+            },
+        )
+    }
 
     private fun createChannels() {
         val manager = getSystemService(NotificationManager::class.java)
@@ -215,8 +291,8 @@ class MessageNotificationService : Service() {
         .setSilent(true)
         .build()
 
-    private fun showMessageNotification(sender: String, unreadCount: Int) {
-        val detail = if (unreadCount == 1) {
+    private fun showMessageNotification(sender: String, unreadCount: Int, preview: String?) {
+        val detail = preview?.takeIf { it.isNotBlank() } ?: if (unreadCount == 1) {
             "New encrypted message from $sender"
         } else {
             "$unreadCount new encrypted messages from $sender"
@@ -231,12 +307,26 @@ class MessageNotificationService : Service() {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val remoteInput = RemoteInput.Builder(REMOTE_INPUT_KEY)
+            .setLabel("Reply")
+            .build()
+        val replyIntent = PendingIntent.getBroadcast(
+            this,
+            sender.hashCode(),
+            Intent(this, InlineReplyReceiver::class.java).putExtra(EXTRA_CONTACT, sender),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+        val replyAction = NotificationCompat.Action.Builder(0, "Reply", replyIntent)
+            .addRemoteInput(remoteInput)
+            .setAllowGeneratedReplies(true)
+            .build()
         val notification = NotificationCompat.Builder(this, MESSAGE_CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("Peep")
             .setContentText(detail)
             .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
             .setContentIntent(contentIntent)
+            .addAction(replyAction)
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .build()
@@ -266,15 +356,69 @@ class MessageNotificationService : Service() {
     }
 
     private fun preferences(): SharedPreferences {
-        val key = MasterKey.Builder(applicationContext)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        return EncryptedSharedPreferences.create(
-            applicationContext,
-            PREFS_FILE,
-            key,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        )
+        return securePreferences(applicationContext)
+    }
+
+    private fun decryptMessagePreview(sender: String, payload: JSONObject): String? = runCatching {
+        val encodedKey = preferences().getString("$CONVERSATION_KEY_PREFIX${sender.lowercase()}", null)
+            ?: return null
+        val key = Base64.getDecoder().decode(encodedKey)
+        val iv = Base64.getDecoder().decode(payload.getString("iv"))
+        val ciphertext = Base64.getDecoder().decode(payload.getString("ciphertext"))
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        val plaintext = JSONObject(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
+        if (plaintext.optString("kind") == "chat") plaintext.optString("text").trim() else null
+    }.getOrNull()
+
+    private fun sendInlineReply(contact: String, text: String) {
+        val token = authToken ?: return
+        val url = socketUrl ?: return
+        val safeContact = contact.trim().lowercase()
+        val safeText = text.trim().take(4_000)
+        if (safeContact.isEmpty() || safeText.isEmpty()) return
+        val encodedKey = preferences().getString("$CONVERSATION_KEY_PREFIX$safeContact", null)
+        if (encodedKey.isNullOrBlank()) {
+            Log.w(LOG_TAG, "No conversation key available for inline reply.")
+            return
+        }
+        val payload = runCatching {
+            val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.ENCRYPT_MODE,
+                SecretKeySpec(Base64.getDecoder().decode(encodedKey), "AES"),
+                GCMParameterSpec(128, iv),
+            )
+            val plaintext = JSONObject().put("kind", "chat").put("text", safeText).toString()
+            JSONObject()
+                .put("kind", "e2ee")
+                .put("iv", Base64.getEncoder().encodeToString(iv))
+                .put("ciphertext", Base64.getEncoder().encodeToString(cipher.doFinal(plaintext.toByteArray())))
+        }.getOrElse {
+            Log.w(LOG_TAG, "Could not encrypt inline reply.", it)
+            return
+        }
+        val directUrl = runCatching {
+            url.toHttpUrl().newBuilder()
+                .query(null)
+                .addQueryParameter("token", token)
+                .addQueryParameter("contact", safeContact)
+                .build()
+        }.getOrElse {
+            Log.w(LOG_TAG, "Could not build inline reply connection.", it)
+            return
+        }
+        client.newWebSocket(Request.Builder().url(directUrl).build(), object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                webSocket.send(JSONObject().put("type", "store").put("payload", payload).toString())
+                webSocket.close(1000, "Inline reply sent")
+                Log.d(LOG_TAG, "Inline reply stored for delivery.")
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.w(LOG_TAG, "Inline reply failed.", t)
+            }
+        })
     }
 }

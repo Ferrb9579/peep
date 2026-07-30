@@ -89,6 +89,14 @@ Future<void> startMessageNotifications({
 Future<void> stopMessageNotifications() =>
     _messageNotificationChannel.invokeMethod<void>('stop');
 
+Future<void> showIncomingMessageNotification({
+  required String contact,
+  required String preview,
+}) => _messageNotificationChannel.invokeMethod<void>('showIncomingMessage', {
+  'contact': contact,
+  'preview': preview,
+});
+
 Widget buildPlatformMediaView(String viewType) {
   final renderer = _videoRenderers[viewType];
   if (renderer != null) {
@@ -1546,6 +1554,7 @@ class PeerClient {
   final Map<String, _IncomingAttachment> _incomingAttachments = {};
   EcKeyPair? _privateKey;
   SecretKey? _aesKey;
+  String? _contactUsername;
   String? _e2eePublicKey;
   Map<String, dynamic>? _pendingEncryptionKey;
   bool _encryptionHandshakeStarted = false;
@@ -1599,6 +1608,7 @@ class PeerClient {
         ? _directRoom(accountUsername, contactUsername)
         : room.trim();
     _roomKeyStorageKey = 'peep:e2ee-room:$effectiveRoom';
+    _contactUsername = contactUsername?.trim().toLowerCase();
     await _loadPersistedRoomKey();
     onStatus(PeerStatus.signaling);
     _peerConnection = await createPeerConnection({
@@ -1874,6 +1884,7 @@ class PeerClient {
     _pendingEncryptionKey = null;
     _encryptionHandshakeStarted = false;
     _roomKeyStorageKey = null;
+    _contactUsername = null;
     onStatus(PeerStatus.disconnected);
     onMediaChanged();
   }
@@ -2314,14 +2325,22 @@ class PeerClient {
   Future<void> _loadPersistedRoomKey() async {
     final storageKey = _roomKeyStorageKey;
     if (storageKey == null) return;
-    final encoded = _preferences.getString(storageKey);
+    var encoded = await EncryptedStore.instance.read(storageKey);
+    final legacyValue = _preferences.getString(storageKey);
+    if ((encoded == null || encoded.isEmpty) &&
+        legacyValue?.isNotEmpty == true) {
+      encoded = legacyValue;
+      await EncryptedStore.instance.write(storageKey, legacyValue!);
+      await _preferences.remove(storageKey);
+    }
     if (encoded?.isNotEmpty == true) {
       try {
         _aesKey = SecretKey(base64Decode(encoded!));
+        await _cacheConversationKey(encoded);
         onLog('Loaded saved E2EE room key.');
         onMediaChanged();
       } catch (error) {
-        await _preferences.remove(storageKey);
+        await EncryptedStore.instance.delete(storageKey);
         onLog('Saved E2EE room key could not be loaded: $error');
       }
     }
@@ -2331,10 +2350,24 @@ class PeerClient {
     final storageKey = _roomKeyStorageKey;
     final key = _aesKey;
     if (storageKey == null || key == null) return;
-    await _preferences.setString(
-      storageKey,
-      base64Encode(await key.extractBytes()),
-    );
+    final encoded = base64Encode(await key.extractBytes());
+    await EncryptedStore.instance.write(storageKey, encoded);
+    await _preferences.remove(storageKey);
+    await _cacheConversationKey(encoded);
+  }
+
+  Future<void> _cacheConversationKey(String encoded) async {
+    final contact = _contactUsername;
+    if (contact == null || contact.isEmpty) return;
+    try {
+      await _messageNotificationChannel.invokeMethod<void>(
+        'cacheConversationKey',
+        {'contact': contact, 'key': encoded},
+      );
+    } catch (_) {
+      // The shared native key cache is Android-only and only accelerates
+      // notification previews and inline replies.
+    }
   }
 
   Future<void> _connectSocket(Uri uri) async {

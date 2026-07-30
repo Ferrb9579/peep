@@ -159,7 +159,8 @@ class PeerChatScreen extends StatefulWidget {
   State<PeerChatScreen> createState() => _PeerChatScreenState();
 }
 
-class _PeerChatScreenState extends State<PeerChatScreen> {
+class _PeerChatScreenState extends State<PeerChatScreen>
+    with WidgetsBindingObserver {
   final _signalingController = TextEditingController(
     // Android emulators reach the host machine through 10.0.2.2, not
     // localhost. This keeps a fresh mobile install connected to the local
@@ -185,6 +186,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   AuthSession? _session;
   bool _authBusy = false;
   bool _groupsBusy = false;
+  bool _isInForeground = true;
   bool _groupChatActive = false;
   String _activeTitle = 'Direct chat';
   String _activeSubtitle = '';
@@ -222,6 +224,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _client = PeerClient(
       onStatus: (status) {
         if (mounted) {
@@ -233,6 +236,14 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
           setState(() => _messages.add(message));
           _saveActiveHistory();
           _scrollToEnd();
+          if (!message.isLocal && !_isInForeground && !_groupChatActive) {
+            unawaited(
+              showIncomingMessageNotification(
+                contact: _activeTitle,
+                preview: message.text,
+              ),
+            );
+          }
         }
       },
       onLog: (message) {
@@ -284,6 +295,11 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
     unawaited(_loadInitialNotificationContact());
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isInForeground = state == AppLifecycleState.resumed;
+  }
+
   Future<void> _loadInitialNotificationContact() async {
     final contact = await takeInitialMessageNotificationContact();
     if (contact != null && contact.isNotEmpty) {
@@ -302,6 +318,7 @@ class _PeerChatScreenState extends State<PeerChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _client.disconnect();
     _groupClient.disconnect();
     _messageNotificationSubscription?.cancel();
