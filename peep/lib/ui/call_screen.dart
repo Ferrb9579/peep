@@ -79,7 +79,7 @@ class CallScreen extends StatelessWidget {
                 children: [
                   CircleAvatar(
                     radius: 32,
-                    backgroundColor: const Color(0xff315dca),
+                    backgroundColor: const Color(0xff4f46e5),
                     child: Text(
                       title.isEmpty
                           ? '?'
@@ -94,6 +94,9 @@ class CallScreen extends StatelessWidget {
                   const SizedBox(height: 10),
                   Text(
                     title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 24,
@@ -161,8 +164,10 @@ class CallScreen extends StatelessWidget {
                       ],
                     )
                   : active
-                  ? Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  ? Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 16,
+                      runSpacing: 16,
                       children: [
                         _RoundControl(
                           icon: microphoneEnabled
@@ -182,7 +187,7 @@ class CallScreen extends StatelessWidget {
                           icon: screenShareEnabled
                               ? Icons.stop_screen_share_rounded
                               : Icons.screen_share_rounded,
-                          label: 'Share',
+                          label: screenShareEnabled ? 'Stop sharing' : 'Share',
                           onPressed: onToggleScreenShare,
                         ),
                         _RoundControl(
@@ -282,6 +287,8 @@ class _RoundControl extends StatelessWidget {
         color: color,
         shape: const CircleBorder(),
         child: IconButton(
+          tooltip: label,
+          constraints: const BoxConstraints(minWidth: 52, minHeight: 52),
           onPressed: onPressed,
           color: Colors.white,
           icon: Icon(icon),

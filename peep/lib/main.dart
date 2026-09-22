@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 
 import 'ui/call_screen.dart';
 import 'ui/messenger_home.dart';
+import 'ui/peep_theme.dart';
 import 'webrtc_peer_stub.dart'
     if (dart.library.io) 'webrtc_peer_native.dart'
     if (dart.library.html) 'webrtc_peer_web.dart';
@@ -23,118 +24,10 @@ class MainApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const primary = Color(0xff4f46e5);
-    const ink = Color(0xff172033);
-    const muted = Color(0xff667085);
-    const border = Color(0xffe4e7ec);
-
     return MaterialApp(
       title: 'Peep',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: primary,
-          brightness: Brightness.light,
-          primary: primary,
-          surface: Colors.white,
-          error: const Color(0xffd92d20),
-        ),
-        scaffoldBackgroundColor: const Color(0xfff5f7fb),
-        useMaterial3: true,
-        dividerColor: border,
-        textTheme: const TextTheme(
-          headlineLarge: TextStyle(
-            color: ink,
-            fontSize: 40,
-            height: 1.12,
-            fontWeight: FontWeight.w800,
-            letterSpacing: -1.2,
-          ),
-          headlineSmall: TextStyle(
-            color: ink,
-            fontSize: 28,
-            height: 1.2,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.5,
-          ),
-          titleLarge: TextStyle(
-            color: ink,
-            fontSize: 20,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.2,
-          ),
-          titleMedium: TextStyle(
-            color: ink,
-            fontSize: 16,
-            fontWeight: FontWeight.w700,
-          ),
-          titleSmall: TextStyle(
-            color: ink,
-            fontSize: 14,
-            fontWeight: FontWeight.w700,
-          ),
-          bodyLarge: TextStyle(color: ink, fontSize: 16, height: 1.5),
-          bodyMedium: TextStyle(color: ink, fontSize: 14, height: 1.45),
-          bodySmall: TextStyle(color: muted, fontSize: 12, height: 1.4),
-          labelLarge: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: const Color(0xfff9fafb),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: border),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: border),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: primary, width: 1.6),
-          ),
-          labelStyle: const TextStyle(color: muted),
-          hintStyle: const TextStyle(color: Color(0xff98a2b3)),
-        ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            minimumSize: const Size(48, 50),
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-            ),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(
-            minimumSize: const Size(48, 50),
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-            side: const BorderSide(color: border),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-            ),
-          ),
-        ),
-        iconButtonTheme: IconButtonThemeData(
-          style: IconButton.styleFrom(
-            minimumSize: const Size(44, 44),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-          ),
-        ),
-        dialogTheme: DialogThemeData(
-          backgroundColor: Colors.white,
-          surfaceTintColor: Colors.transparent,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(24),
-          ),
-        ),
-      ),
+      theme: PeepTheme.light,
       home: const PeerChatScreen(),
     );
   }
