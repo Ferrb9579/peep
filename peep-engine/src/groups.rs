@@ -271,3 +271,98 @@ fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Err
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("groups sqlite connection lock poisoned")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::GroupStore;
+    use crate::auth::AuthStore;
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "peep-groups-{}-{}.sqlite3",
+                std::process::id(),
+                super::unix_seconds().expect("clock should be available")
+            )))
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["", "-shm", "-wal"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0.display(), suffix));
+            }
+        }
+    }
+
+    #[test]
+    fn create_lists_members_and_rejects_partial_unknown_groups() {
+        let database = TestDatabase::new();
+        let auth = AuthStore::open(&database.0).expect("auth store should open");
+        auth.register("owner@example.com", "owner", "PeepTest!2026")
+            .expect("owner should register");
+        auth.register("member@example.com", "member", "PeepTest!2026")
+            .expect("member should register");
+        auth.register("outsider@example.com", "outsider", "PeepTest!2026")
+            .expect("outsider should register");
+
+        let groups = GroupStore::open(&database.0).expect("group store should open");
+        let created = groups
+            .create(
+                "owner",
+                "Backend Team",
+                &["MEMBER".to_string(), "member".to_string()],
+            )
+            .expect("valid group should be created");
+
+        assert_eq!(created.name, "Backend Team");
+        assert_eq!(created.members, ["member", "owner"]);
+        assert_eq!(
+            groups
+                .list_for_user("owner")
+                .expect("owner list should load")
+                .len(),
+            1
+        );
+        assert_eq!(
+            groups
+                .list_for_user("member")
+                .expect("member list should load")
+                .len(),
+            1
+        );
+        assert!(
+            groups
+                .list_for_user("outsider")
+                .expect("outsider list should load")
+                .is_empty()
+        );
+        assert!(
+            groups
+                .is_member("member", &created.id)
+                .expect("membership should load")
+        );
+        assert!(
+            !groups
+                .is_member("outsider", &created.id)
+                .expect("membership should load")
+        );
+
+        let error = groups
+            .create("owner", "Invalid", &["missing-user".to_string()])
+            .expect_err("unknown member must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            groups
+                .list_for_user("owner")
+                .expect("owner list should still load")
+                .len(),
+            1,
+            "failed creation must not leave a partial group"
+        );
+    }
+}

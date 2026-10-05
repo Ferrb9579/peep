@@ -5,10 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 
 class ScreenShareService : Service() {
     override fun onCreate() {
@@ -55,6 +57,7 @@ class ScreenShareService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        takeStartCallback()?.invoke()
         return START_NOT_STICKY
     }
 
@@ -63,5 +66,31 @@ class ScreenShareService : Service() {
     companion object {
         private const val CHANNEL_ID = "peep_screen_share"
         private const val NOTIFICATION_ID = 2401
+        private val callbackLock = Any()
+        private var startCallback: (() -> Unit)? = null
+
+        fun start(context: Context, onStarted: () -> Unit) {
+            synchronized(callbackLock) {
+                startCallback = onStarted
+            }
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, ScreenShareService::class.java),
+                )
+            } catch (error: RuntimeException) {
+                synchronized(callbackLock) {
+                    startCallback = null
+                }
+                throw error
+            }
+        }
+
+        private fun takeStartCallback(): (() -> Unit)? =
+            synchronized(callbackLock) {
+                startCallback.also {
+                    startCallback = null
+                }
+            }
     }
 }

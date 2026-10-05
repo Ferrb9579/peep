@@ -356,14 +356,33 @@ Future<void> ensureGroupKeyPublished({
   required GroupSummary group,
 }) async {
   final storageKey = _groupKeyStorageKey(group.id);
-  if (_preferences.getString(storageKey)?.isNotEmpty == true) return;
-  final rawKey = _secureRandomBytes(32);
-  await _preferences.setString(storageKey, base64Encode(rawKey));
+  final existing = _preferences.getString(storageKey);
+  final rawKey = existing?.isNotEmpty == true
+      ? Uint8List.fromList(base64Decode(existing!))
+      : _secureRandomBytes(32);
+  if (existing?.isNotEmpty != true) {
+    await _preferences.setString(storageKey, base64Encode(rawKey));
+  }
   await _publishGroupKeyEnvelopes(
     signalingUri: signalingUri,
     session: session,
     groupId: group.id,
     rawGroupKey: rawKey,
+  );
+}
+
+Future<void> republishStoredGroupKeyIfPresent({
+  required Uri signalingUri,
+  required AuthSession session,
+  required GroupSummary group,
+}) async {
+  final stored = _preferences.getString(_groupKeyStorageKey(group.id));
+  if (stored == null || stored.isEmpty) return;
+  await _publishGroupKeyEnvelopes(
+    signalingUri: signalingUri,
+    session: session,
+    groupId: group.id,
+    rawGroupKey: Uint8List.fromList(base64Decode(stored)),
   );
 }
 
@@ -932,6 +951,8 @@ class GroupClient {
   bool _screenShareEnabled = false;
   bool _conferenceRefreshQueued = false;
   CallState _callState = CallState.idle;
+  final Map<String, _IncomingAttachment> _incomingAttachments = {};
+  static const int _attachmentChunkSize = 4 * 1024;
 
   bool get canSend => _socketOpen;
   bool get cameraEnabled => _cameraEnabled;
@@ -954,6 +975,7 @@ class GroupClient {
   }) async {
     await disconnect();
     _closed = false;
+    _incomingAttachments.clear();
     _groupKey = SecretKey(base64Decode(groupKeyBase64));
     onStatus(PeerStatus.signaling);
     await _connectSocket(
@@ -974,6 +996,51 @@ class GroupClient {
     }
     unawaited(_sendEncrypted({'kind': 'group-chat', 'body': text}));
     onMessage(ChatMessage(text: text, isLocal: true, sentAt: DateTime.now()));
+  }
+
+  Future<void> pickAndSendAttachment() async {
+    if (!_socketOpen) {
+      onLog('Open the group chat before sending an attachment.');
+      return;
+    }
+    final result = await fp.FilePicker.platform.pickFiles(
+      type: fp.FileType.media,
+      allowMultiple: false,
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.single;
+    final bytes =
+        file.bytes ??
+        (file.path == null ? null : await File(file.path!).readAsBytes());
+    if (bytes == null) {
+      onLog('Could not read attachment.');
+      return;
+    }
+    final mimeType =
+        lookupMimeType(file.name, headerBytes: bytes) ??
+        'application/octet-stream';
+    if (!mimeType.startsWith('audio/') && !mimeType.startsWith('video/')) {
+      onLog('Choose an audio or video file.');
+      return;
+    }
+    final attachment = _registerAttachment(
+      AttachmentData(
+        name: file.name,
+        mimeType: mimeType,
+        size: bytes.length,
+        dataUrl: 'data:$mimeType;base64,${base64Encode(bytes)}',
+      ),
+    );
+    onMessage(
+      ChatMessage(
+        text: file.name,
+        isLocal: true,
+        sentAt: DateTime.now(),
+        attachment: attachment,
+      ),
+    );
+    await _sendAttachment(attachment);
   }
 
   Future<void> startConference({
@@ -1029,10 +1096,10 @@ class GroupClient {
             _localStream?.getVideoTracks().isEmpty != false)) {
       try {
         if (_screenShareEnabled) {
-          _stopLocalVideoTracks();
+          _screenShareEnabled = false;
+          await _stopLocalVideoTracks();
           await _stopScreenShareService();
         }
-        _screenShareEnabled = false;
         await _ensureLocalMedia(audio: false, video: true);
         await _joinPublisher();
         _publishConferenceRefresh();
@@ -1044,7 +1111,7 @@ class GroupClient {
       return;
     }
     if (!enabled) {
-      final stopped = _stopLocalVideoTracks();
+      final stopped = await _stopLocalVideoTracks();
       _cameraEnabled = false;
       _screenShareEnabled = false;
       if (stopped) {
@@ -1096,9 +1163,9 @@ class GroupClient {
       return;
     }
     if (!enabled) {
-      final stopped = _stopLocalVideoTracks();
       _screenShareEnabled = false;
       _cameraEnabled = false;
+      final stopped = await _stopLocalVideoTracks();
       await _stopScreenShareService();
       if (stopped) {
         await _joinPublisher();
@@ -1109,8 +1176,8 @@ class GroupClient {
       return;
     }
     try {
-      await _startScreenShareService();
-      _stopLocalVideoTracks();
+      await _prepareAndroidScreenShare();
+      await _stopLocalVideoTracks();
       final screen = await navigator.mediaDevices.getDisplayMedia({
         'audio': false,
         'video': true,
@@ -1146,6 +1213,7 @@ class GroupClient {
     _socket = null;
     _socketOpen = false;
     _groupKey = null;
+    _incomingAttachments.clear();
     onStatus(PeerStatus.disconnected);
   }
 
@@ -1243,21 +1311,106 @@ class GroupClient {
         iv: Uint8List.fromList(base64Decode(payload['iv'] as String)),
       );
       final appPayload = jsonDecode(utf8.decode(plaintext));
-      if (appPayload is Map<String, dynamic> &&
-          appPayload['kind'] == 'group-chat' &&
-          appPayload['body'] is String) {
-        onMessage(
-          ChatMessage(
-            text: appPayload['body'] as String,
-            isLocal: false,
-            sentAt: DateTime.now(),
-            sender: decoded['from'] as String?,
-          ),
-        );
+      if (appPayload is! Map<String, dynamic>) return;
+      final sender = decoded['from'] as String?;
+      switch (appPayload['kind']) {
+        case 'group-chat':
+          if (appPayload['body'] is String) {
+            onMessage(
+              ChatMessage(
+                text: appPayload['body'] as String,
+                isLocal: false,
+                sentAt: DateTime.now(),
+                sender: sender,
+              ),
+            );
+          }
+        case 'group-attachment-start':
+          _handleGroupAttachmentStart(appPayload);
+        case 'group-attachment-chunk':
+          _handleGroupAttachmentChunk(appPayload);
+        case 'group-attachment-end':
+          _handleGroupAttachmentEnd(appPayload, sender);
       }
     } catch (error) {
       onLog('Could not decrypt group message: $error');
     }
+  }
+
+  Future<void> _sendAttachment(AttachmentData attachment) async {
+    final id = 'group-attachment-${DateTime.now().microsecondsSinceEpoch}';
+    await _sendEncrypted({
+      'kind': 'group-attachment-start',
+      'id': id,
+      'name': attachment.name,
+      'mimeType': attachment.mimeType,
+      'size': attachment.size,
+    });
+    for (
+      var offset = 0;
+      offset < attachment.dataUrl.length;
+      offset += _attachmentChunkSize
+    ) {
+      final end = min(offset + _attachmentChunkSize, attachment.dataUrl.length);
+      await _sendEncrypted({
+        'kind': 'group-attachment-chunk',
+        'id': id,
+        'data': attachment.dataUrl.substring(offset, end),
+      });
+      if (offset % (_attachmentChunkSize * 16) == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+    await _sendEncrypted({'kind': 'group-attachment-end', 'id': id});
+    onLog('Group attachment sent: ${attachment.name}.');
+  }
+
+  void _handleGroupAttachmentStart(Map<String, dynamic> payload) {
+    if (payload['id'] is! String ||
+        payload['name'] is! String ||
+        payload['mimeType'] is! String ||
+        payload['size'] is! int) {
+      return;
+    }
+    _incomingAttachments[payload['id'] as String] = _IncomingAttachment(
+      name: payload['name'] as String,
+      mimeType: payload['mimeType'] as String,
+      size: payload['size'] as int,
+    );
+    onLog('Receiving group attachment: ${payload['name']}.');
+  }
+
+  void _handleGroupAttachmentChunk(Map<String, dynamic> payload) {
+    final id = payload['id'];
+    final data = payload['data'];
+    if (id is String && data is String) {
+      _incomingAttachments[id]?.data.write(data);
+    }
+  }
+
+  void _handleGroupAttachmentEnd(Map<String, dynamic> payload, String? sender) {
+    final id = payload['id'];
+    if (id is! String) return;
+    final incoming = _incomingAttachments.remove(id);
+    if (incoming == null) return;
+    final attachment = _registerAttachment(
+      AttachmentData(
+        name: incoming.name,
+        mimeType: incoming.mimeType,
+        size: incoming.size,
+        dataUrl: incoming.data.toString(),
+      ),
+    );
+    onMessage(
+      ChatMessage(
+        text: incoming.name,
+        isLocal: false,
+        sentAt: DateTime.now(),
+        sender: sender,
+        attachment: attachment,
+      ),
+    );
+    onLog('Group attachment received: ${incoming.name}.');
   }
 
   Future<void> _ensureLocalMedia({
@@ -1284,13 +1437,20 @@ class GroupClient {
     onMediaChanged();
   }
 
-  bool _stopLocalVideoTracks() {
+  Future<bool> _stopLocalVideoTracks() async {
+    final stream = _localStream;
     final tracks = List<MediaStreamTrack>.from(
-      _localStream?.getVideoTracks() ?? const [],
+      stream?.getVideoTracks() ?? const [],
     );
     for (final track in tracks) {
+      if (stream != null) {
+        try {
+          await stream.removeTrack(track);
+        } catch (error) {
+          onLog('Could not detach local video track: $error');
+        }
+      }
       track.stop();
-      _localStream?.removeTrack(track);
     }
     _localRenderer.srcObject = _localStream;
     return tracks.isNotEmpty;
@@ -1745,10 +1905,10 @@ class PeerClient {
             _localStream?.getVideoTracks().isEmpty != false)) {
       try {
         if (_screenShareEnabled) {
-          _stopLocalVideoTracks();
+          _screenShareEnabled = false;
+          await _stopLocalVideoTracks();
           await _stopScreenShareService();
         }
-        _screenShareEnabled = false;
         await _startLocalMedia(
           audio: _localStream?.getAudioTracks().isEmpty != false,
           video: true,
@@ -1762,7 +1922,7 @@ class PeerClient {
       return;
     }
     if (!enabled) {
-      final stopped = _stopLocalVideoTracks();
+      final stopped = await _stopLocalVideoTracks();
       _cameraEnabled = false;
       _screenShareEnabled = false;
       if (stopped) await _createAndSendOffer();
@@ -1810,9 +1970,9 @@ class PeerClient {
       return;
     }
     if (!enabled) {
-      final stopped = _stopLocalVideoTracks();
       _screenShareEnabled = false;
       _cameraEnabled = false;
+      final stopped = await _stopLocalVideoTracks();
       await _stopScreenShareService();
       if (stopped) await _createAndSendOffer();
       onLog('Screen sharing stopped.');
@@ -1820,8 +1980,8 @@ class PeerClient {
       return;
     }
     try {
-      await _startScreenShareService();
-      _stopLocalVideoTracks();
+      await _prepareAndroidScreenShare();
+      await _stopLocalVideoTracks();
       final screen = await navigator.mediaDevices.getDisplayMedia({
         'audio': false,
         'video': true,
@@ -1954,13 +2114,20 @@ class PeerClient {
     onMediaChanged();
   }
 
-  bool _stopLocalVideoTracks() {
+  Future<bool> _stopLocalVideoTracks() async {
+    final stream = _localStream;
     final tracks = List<MediaStreamTrack>.from(
-      _localStream?.getVideoTracks() ?? const [],
+      stream?.getVideoTracks() ?? const [],
     );
     for (final track in tracks) {
+      if (stream != null) {
+        try {
+          await stream.removeTrack(track);
+        } catch (error) {
+          onLog('Could not detach local video track: $error');
+        }
+      }
       track.stop();
-      _localStream?.removeTrack(track);
     }
     _localRenderer.srcObject = _localStream;
     return tracks.isNotEmpty;
@@ -2590,9 +2757,18 @@ const MethodChannel _screenShareServiceChannel = MethodChannel(
   'peep/screen_share_service',
 );
 
-Future<void> _startScreenShareService() async {
+Future<void> _prepareAndroidScreenShare() async {
   if (!Platform.isAndroid) return;
   await Permission.notification.request();
+  final allowed = await Helper.requestCapturePermission(fullScreenOnly: true);
+  if (!allowed) {
+    throw StateError('Screen capture permission was denied.');
+  }
+  await _startScreenShareService();
+}
+
+Future<void> _startScreenShareService() async {
+  if (!Platform.isAndroid) return;
   await _screenShareServiceChannel.invokeMethod<void>('start');
 }
 

@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:html' as html;
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
+import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
@@ -225,19 +226,35 @@ Future<void> ensureGroupKeyPublished({
   required GroupSummary group,
 }) async {
   final existing = html.window.localStorage[_groupKeyStorageKey(group.id)];
-  if (existing != null && existing.isNotEmpty) {
-    return;
+  final rawGroupKey = existing != null && existing.isNotEmpty
+      ? Uint8List.fromList(base64Decode(existing))
+      : Uint8List(32);
+  if (existing == null || existing.isEmpty) {
+    html.window.crypto!.getRandomValues(rawGroupKey);
+    html.window.localStorage[_groupKeyStorageKey(group.id)] = base64Encode(
+      rawGroupKey,
+    );
   }
-
-  final rawGroupKey = Uint8List(32);
-  html.window.crypto!.getRandomValues(rawGroupKey);
-  final rawGroupKeyBase64 = base64Encode(rawGroupKey);
-  html.window.localStorage[_groupKeyStorageKey(group.id)] = rawGroupKeyBase64;
   await _publishGroupKeyEnvelopes(
     signalingUri: signalingUri,
     session: session,
     groupId: group.id,
     rawGroupKey: rawGroupKey,
+  );
+}
+
+Future<void> republishStoredGroupKeyIfPresent({
+  required Uri signalingUri,
+  required AuthSession session,
+  required GroupSummary group,
+}) async {
+  final stored = html.window.localStorage[_groupKeyStorageKey(group.id)];
+  if (stored == null || stored.isEmpty) return;
+  await _publishGroupKeyEnvelopes(
+    signalingUri: signalingUri,
+    session: session,
+    groupId: group.id,
+    rawGroupKey: Uint8List.fromList(base64Decode(stored)),
   );
 }
 
@@ -752,8 +769,11 @@ class GroupClient {
   bool _screenShareEnabled = false;
   bool _conferenceRefreshQueued = false;
   CallState _callState = CallState.idle;
+  final Map<String, _IncomingAttachment> _incomingAttachments = {};
   static int _nextViewId = 0;
   static int _nextRemoteViewId = 0;
+  static int _nextAttachmentId = 0;
+  static const int _attachmentChunkSize = 4 * 1024;
 
   bool get canSend => _socket?.readyState == html.WebSocket.OPEN;
   bool get cameraEnabled => _cameraEnabled;
@@ -799,6 +819,7 @@ class GroupClient {
   }) async {
     await disconnect();
     _closed = false;
+    _incomingAttachments.clear();
     _groupAesKey = await _importAesGcmKey(groupKeyBase64);
     onStatus(PeerStatus.signaling);
     final url = signalingUri.replace(
@@ -820,6 +841,46 @@ class GroupClient {
 
     unawaited(_sendEncrypted(socket, {'kind': 'group-chat', 'body': text}));
     onMessage(ChatMessage(text: text, isLocal: true, sentAt: DateTime.now()));
+  }
+
+  Future<void> pickAndSendAttachment() async {
+    final socket = _socket;
+    if (socket == null || socket.readyState != html.WebSocket.OPEN) {
+      onLog('Open the group chat before sending an attachment.');
+      return;
+    }
+    final input = html.FileUploadInputElement()
+      ..accept = 'audio/*,video/*'
+      ..multiple = false;
+    final completer = Completer<html.File?>();
+    input.onChange.first.then((_) {
+      completer.complete(
+        input.files?.isNotEmpty == true ? input.files!.first : null,
+      );
+    });
+    input.click();
+    final file = await completer.future;
+    if (file == null) return;
+    if (!file.type.startsWith('audio/') && !file.type.startsWith('video/')) {
+      onLog('Choose an audio or video file.');
+      return;
+    }
+    final dataUrl = await _readGroupFileAsDataUrl(file);
+    final attachment = _createGroupAttachmentData(
+      name: file.name,
+      mimeType: file.type,
+      size: file.size,
+      dataUrl: dataUrl,
+    );
+    onMessage(
+      ChatMessage(
+        text: file.name,
+        isLocal: true,
+        sentAt: DateTime.now(),
+        attachment: attachment,
+      ),
+    );
+    await _sendGroupAttachment(file: file, dataUrl: dataUrl);
   }
 
   Future<void> startConference({
@@ -1003,6 +1064,7 @@ class GroupClient {
     _socket?.close();
     _socket = null;
     _groupAesKey = null;
+    _incomingAttachments.clear();
     onStatus(PeerStatus.disconnected);
   }
 
@@ -1145,20 +1207,174 @@ class GroupClient {
       if (appPayload is! Map<String, dynamic>) {
         return;
       }
-      if (appPayload['kind'] == 'group-chat' && appPayload['body'] is String) {
-        final from = decoded['from'];
-        onMessage(
-          ChatMessage(
-            text: appPayload['body'] as String,
-            isLocal: false,
-            sentAt: DateTime.now(),
-            sender: from is String ? from : null,
-          ),
-        );
+      final from = decoded['from'];
+      final sender = from is String ? from : null;
+      switch (appPayload['kind']) {
+        case 'group-chat':
+          if (appPayload['body'] is String) {
+            onMessage(
+              ChatMessage(
+                text: appPayload['body'] as String,
+                isLocal: false,
+                sentAt: DateTime.now(),
+                sender: sender,
+              ),
+            );
+          }
+          break;
+        case 'group-attachment-start':
+          _handleGroupAttachmentStart(appPayload);
+          break;
+        case 'group-attachment-chunk':
+          _handleGroupAttachmentChunk(appPayload);
+          break;
+        case 'group-attachment-end':
+          _handleGroupAttachmentEnd(appPayload, sender);
+          break;
       }
     } catch (error) {
       onLog('Could not decrypt group message: $error');
     }
+  }
+
+  Future<void> _sendGroupAttachment({
+    required html.File file,
+    required String dataUrl,
+  }) async {
+    final socket = _socket;
+    if (socket == null || socket.readyState != html.WebSocket.OPEN) return;
+    final id =
+        'group-attachment-${DateTime.now().microsecondsSinceEpoch}-${_nextAttachmentId++}';
+    await _sendEncrypted(socket, {
+      'kind': 'group-attachment-start',
+      'id': id,
+      'name': file.name,
+      'mimeType': file.type,
+      'size': file.size,
+    });
+    for (
+      var offset = 0;
+      offset < dataUrl.length;
+      offset += _attachmentChunkSize
+    ) {
+      final end = min(offset + _attachmentChunkSize, dataUrl.length);
+      await _sendEncrypted(socket, {
+        'kind': 'group-attachment-chunk',
+        'id': id,
+        'data': dataUrl.substring(offset, end),
+      });
+      while ((socket.bufferedAmount ?? 0) > 512 * 1024) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+    }
+    await _sendEncrypted(socket, {'kind': 'group-attachment-end', 'id': id});
+    onLog('Group attachment sent: ${file.name}.');
+  }
+
+  Future<String> _readGroupFileAsDataUrl(html.File file) {
+    final completer = Completer<String>();
+    final reader = html.FileReader();
+    reader.onLoad.first.then((_) {
+      final result = reader.result;
+      if (result is String) {
+        completer.complete(result);
+      } else {
+        completer.completeError(StateError('Could not read attachment.'));
+      }
+    });
+    reader.onError.first.then((_) {
+      completer.completeError(StateError('Could not read attachment.'));
+    });
+    reader.readAsDataUrl(file);
+    return completer.future;
+  }
+
+  void _handleGroupAttachmentStart(Map<String, dynamic> payload) {
+    final id = payload['id'];
+    final name = payload['name'];
+    final mimeType = payload['mimeType'];
+    final size = payload['size'];
+    if (id is! String ||
+        name is! String ||
+        mimeType is! String ||
+        size is! int) {
+      return;
+    }
+    _incomingAttachments[id] = _IncomingAttachment(
+      name: name,
+      mimeType: mimeType,
+      size: size,
+    );
+    onLog('Receiving group attachment: $name.');
+  }
+
+  void _handleGroupAttachmentChunk(Map<String, dynamic> payload) {
+    final id = payload['id'];
+    final data = payload['data'];
+    if (id is String && data is String) {
+      _incomingAttachments[id]?.data.write(data);
+    }
+  }
+
+  void _handleGroupAttachmentEnd(Map<String, dynamic> payload, String? sender) {
+    final id = payload['id'];
+    if (id is! String) return;
+    final incoming = _incomingAttachments.remove(id);
+    if (incoming == null) return;
+    final attachment = _createGroupAttachmentData(
+      name: incoming.name,
+      mimeType: incoming.mimeType,
+      size: incoming.size,
+      dataUrl: incoming.data.toString(),
+    );
+    onMessage(
+      ChatMessage(
+        text: incoming.name,
+        isLocal: false,
+        sentAt: DateTime.now(),
+        sender: sender,
+        attachment: attachment,
+      ),
+    );
+    onLog('Group attachment received: ${incoming.name}.');
+  }
+
+  AttachmentData _createGroupAttachmentData({
+    required String name,
+    required String mimeType,
+    required int size,
+    required String dataUrl,
+  }) {
+    final isVideo = mimeType.startsWith('video/');
+    String? viewType;
+    if (isVideo || mimeType.startsWith('audio/')) {
+      viewType =
+          'peep-group-attachment-${DateTime.now().microsecondsSinceEpoch}-${_nextAttachmentId++}';
+      ui_web.platformViewRegistry.registerViewFactory(viewType, (int viewId) {
+        if (isVideo) {
+          return html.VideoElement()
+            ..src = dataUrl
+            ..controls = true
+            ..preload = 'metadata'
+            ..setAttribute('playsinline', 'true')
+            ..style.width = '100%'
+            ..style.height = '100%'
+            ..style.objectFit = 'cover';
+        }
+        return html.AudioElement()
+          ..src = dataUrl
+          ..controls = true
+          ..preload = 'metadata'
+          ..style.width = '100%';
+      });
+    }
+    return AttachmentData(
+      name: name,
+      mimeType: mimeType,
+      size: size,
+      dataUrl: dataUrl,
+      viewType: viewType,
+    );
   }
 
   Future<void> _ensureLocalMedia({

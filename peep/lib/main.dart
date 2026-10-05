@@ -18,6 +18,14 @@ Future<void> main() async {
   runApp(const MainApp());
 }
 
+String _readableError(Object error) {
+  final message = error.toString().replaceFirst(
+    RegExp(r'^(Exception|StateError|Invalid argument):\s*'),
+    '',
+  );
+  return message.isEmpty ? 'Something went wrong. Please try again.' : message;
+}
+
 class MainApp extends StatelessWidget {
   const MainApp({super.key});
 
@@ -497,6 +505,17 @@ class _PeerChatScreenState extends State<PeerChatScreen>
             ..addAll(groups);
         });
       }
+      for (final group in groups) {
+        try {
+          await republishStoredGroupKeyIfPresent(
+            signalingUri: Uri.parse(_signalingController.text.trim()),
+            session: session,
+            group: group,
+          );
+        } catch (error) {
+          _addLog('Could not refresh encryption for ${group.name}: $error');
+        }
+      }
     } catch (error) {
       _addLog('Could not load groups: $error');
     } finally {
@@ -550,21 +569,37 @@ class _PeerChatScreenState extends State<PeerChatScreen>
     }
   }
 
-  Future<void> _createGroup() async {
+  Future<void> _refreshHomeData() async {
+    final session = _session;
+    if (session == null) return;
+    await Future.wait([
+      _loadGroups(session),
+      _loadMailboxSummaries(session),
+      _refreshRecentConversations(session.username),
+    ]);
+  }
+
+  Future<String?> _createGroup() async {
     final session = _session;
     if (session == null) {
-      _addLog('Sign in before creating a group.');
-      return;
+      return 'Sign in before creating a group.';
     }
 
     final members = _groupMembersController.text
         .split(RegExp(r'[\s,]+'))
         .map((member) => member.trim().toLowerCase())
         .where((member) => member.isNotEmpty)
+        .toSet()
         .toList(growable: false);
-    if (_groupNameController.text.trim().isEmpty || members.isEmpty) {
-      _addLog('Enter a group name and at least one member username.');
-      return;
+    final name = _groupNameController.text.trim();
+    if (name.isEmpty) {
+      return 'Enter a group name.';
+    }
+    if (members.isEmpty) {
+      return 'Add at least one member username.';
+    }
+    if (members.length == 1 && members.single == session.username) {
+      return 'Add another account to create a group.';
     }
 
     setState(() => _groupsBusy = true);
@@ -572,22 +607,44 @@ class _PeerChatScreenState extends State<PeerChatScreen>
       final group = await createGroup(
         signalingUri: Uri.parse(_signalingController.text.trim()),
         token: session.token,
-        name: _groupNameController.text.trim(),
+        name: name,
         members: members,
       );
-      await ensureGroupKeyPublished(
-        signalingUri: Uri.parse(_signalingController.text.trim()),
-        session: session,
-        group: group,
-      );
-      setState(() {
-        _groups.insert(0, group);
-        _groupNameController.clear();
-        _groupMembersController.clear();
-      });
+      if (mounted) {
+        setState(() {
+          _groups.removeWhere((existing) => existing.id == group.id);
+          _groups.insert(0, group);
+        });
+      }
+      try {
+        await ensureGroupKeyPublished(
+          signalingUri: Uri.parse(_signalingController.text.trim()),
+          session: session,
+          group: group,
+        );
+      } catch (error) {
+        _addLog('Group encryption setup will retry: $error');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Group created. Encryption setup will retry on refresh.',
+              ),
+            ),
+          );
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _groupNameController.clear();
+          _groupMembersController.clear();
+        });
+      }
       _addLog('Group created: ${group.name}.');
+      return null;
     } catch (error) {
       _addLog('Group create failed: $error');
+      return _readableError(error);
     } finally {
       if (mounted) {
         setState(() => _groupsBusy = false);
@@ -730,7 +787,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
 
   void _sendAttachment() {
     if (_groupChatActive) {
-      _addLog('Group attachments are not available yet.');
+      unawaited(_groupClient.pickAndSendAttachment());
       return;
     }
     unawaited(_client.pickAndSendAttachment());
@@ -859,12 +916,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
                 onOpenChatEntry: _openChatListEntry,
                 onCreateGroup: _createGroup,
                 onOpenGroup: _openGroup,
-                onRefreshGroups: () {
-                  final session = _session;
-                  if (session != null) {
-                    unawaited(_loadGroups(session));
-                  }
-                },
+                onRefreshGroups: _refreshHomeData,
                 onSignOut: _signOut,
                 logs: _logs,
               );
@@ -940,7 +992,9 @@ class _PeerChatScreenState extends State<PeerChatScreen>
               canSend: _groupChatActive
                   ? _groupClient.canSend
                   : _client.canMessage,
-              canAttach: !_groupChatActive && _client.canMessage,
+              canAttach: _groupChatActive
+                  ? _groupClient.canSend
+                  : _client.canMessage,
               onSend: _sendMessage,
               onAttach: _sendAttachment,
             );

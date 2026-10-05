@@ -119,6 +119,12 @@ Future<void> ensureGroupKeyPublished({
   );
 }
 
+Future<void> republishStoredGroupKeyIfPresent({
+  required Uri signalingUri,
+  required AuthSession session,
+  required GroupSummary group,
+}) async {}
+
 Future<String> loadOrFetchGroupKey({
   required Uri signalingUri,
   required AuthSession session,
@@ -249,6 +255,10 @@ class GroupClient {
 
   void send(String text) {
     onLog('Cannot send until a web group socket is connected.');
+  }
+
+  Future<void> pickAndSendAttachment() async {
+    onLog('Group attachments are only available in Flutter app builds.');
   }
 
   Future<void> startConference({

@@ -11,12 +11,14 @@ class ChatListEntry {
     required this.lastText,
     required this.updatedAt,
     required this.unreadCount,
+    this.displayTime,
   });
 
   final String contactUsername;
   final String lastText;
   final DateTime updatedAt;
   final int unreadCount;
+  final String? displayTime;
 }
 
 /// A lightweight local record for the Calls tab. Call transport remains owned
@@ -70,8 +72,8 @@ class MessengerHome extends StatefulWidget {
   final VoidCallback onConnect;
   final ValueChanged<ChatListEntry> onOpenChatEntry;
   final ValueChanged<GroupSummary> onOpenGroup;
-  final VoidCallback onCreateGroup;
-  final VoidCallback onRefreshGroups;
+  final Future<String?> Function() onCreateGroup;
+  final Future<void> Function() onRefreshGroups;
   final VoidCallback onSignOut;
   final List<String> logs;
 
@@ -80,9 +82,20 @@ class MessengerHome extends StatefulWidget {
 }
 
 class _MessengerHomeState extends State<MessengerHome> {
-  static const _primary = Color(0xff3a76f0);
-  static const _ink = Color(0xff1d2533);
+  static const _primary = Color(0xff4f46e5);
+  static const _ink = Color(0xff172033);
+  static const _muted = Color(0xff667085);
+  static const _border = Color(0xffe4e7ec);
+  final _searchController = TextEditingController();
   int _tabIndex = 0;
+  String _searchQuery = '';
+  bool _unreadOnly = false;
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   void _showNewChat() {
     showDialog<void>(
@@ -119,35 +132,10 @@ class _MessengerHomeState extends State<MessengerHome> {
   void _showNewGroup() {
     showDialog<void>(
       context: context,
-      builder: (context) => _MessengerDialog(
-        title: 'New group',
-        actionLabel: widget.groupsBusy ? 'Creating…' : 'Create',
-        enabled: !widget.groupsBusy,
-        onAction: () {
-          Navigator.of(context).pop();
-          widget.onCreateGroup();
-        },
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: widget.groupNameController,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: 'Group name'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: widget.groupMembersController,
-              minLines: 2,
-              maxLines: 3,
-              decoration: const InputDecoration(
-                labelText: 'Member usernames',
-                hintText: 'alex, maya, sam',
-                helperText: 'Separate usernames with commas',
-              ),
-            ),
-          ],
-        ),
+      builder: (context) => _NewGroupDialog(
+        groupNameController: widget.groupNameController,
+        groupMembersController: widget.groupMembersController,
+        onCreate: widget.onCreateGroup,
       ),
     );
   }
@@ -212,40 +200,153 @@ class _MessengerHomeState extends State<MessengerHome> {
     );
   }
 
+  bool _matchesSearch(String title, String subtitle) {
+    final query = _searchQuery.trim().toLowerCase();
+    if (query.isEmpty) return true;
+    return title.toLowerCase().contains(query) ||
+        subtitle.toLowerCase().contains(query);
+  }
+
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() => _searchQuery = '');
+  }
+
   Widget _inbox() {
-    final empty = widget.chatEntries.isEmpty && widget.groups.isEmpty;
+    final sourceEntries = widget.chatEntries;
+    final sourceGroups = widget.groups;
+    final entries = sourceEntries
+        .where(
+          (entry) =>
+              (!_unreadOnly || entry.unreadCount > 0) &&
+              _matchesSearch(entry.contactUsername, entry.lastText),
+        )
+        .toList(growable: false);
+    final groups = _unreadOnly
+        ? const <GroupSummary>[]
+        : sourceGroups
+              .where(
+                (group) => _matchesSearch(
+                  group.name,
+                  '${group.members.length} members encrypted group',
+                ),
+              )
+              .toList(growable: false);
+    final empty = entries.isEmpty && groups.isEmpty;
+    final hasSourceContent =
+        sourceEntries.isNotEmpty || sourceGroups.isNotEmpty;
+
     return RefreshIndicator(
-      onRefresh: () async => widget.onRefreshGroups(),
+      onRefresh: widget.onRefreshGroups,
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 104),
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        padding: const EdgeInsets.fromLTRB(16, 18, 16, 104),
         children: [
           if (widget.connecting)
             const Padding(
-              padding: EdgeInsets.only(bottom: 8),
+              padding: EdgeInsets.only(bottom: 12),
               child: LinearProgressIndicator(minHeight: 2),
             ),
-          if (empty)
-            const Padding(
-              padding: EdgeInsets.only(top: 96),
-              child: _MessengerEmpty(
-                icon: Icons.markunread_outlined,
-                title: 'No messages yet',
-                message: 'Start a new message to begin a private conversation.',
+          TextField(
+            controller: _searchController,
+            onChanged: (value) => setState(() => _searchQuery = value),
+            textInputAction: TextInputAction.search,
+            decoration: InputDecoration(
+              hintText: 'Search or start a conversation',
+              prefixIcon: const Icon(Icons.search_rounded),
+              suffixIcon: _searchQuery.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: 'Clear search',
+                      onPressed: _clearSearch,
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+              filled: true,
+              fillColor: const Color(0xfff6f4ff),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 15,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide.none,
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide.none,
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: const BorderSide(color: _primary, width: 1.5),
               ),
             ),
-          for (final entry in widget.chatEntries)
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              _FilterPill(
+                label: 'All',
+                selected: !_unreadOnly,
+                onTap: () => setState(() => _unreadOnly = false),
+              ),
+              const SizedBox(width: 8),
+              _FilterPill(
+                label: 'Unread',
+                selected: _unreadOnly,
+                onTap: () => setState(() => _unreadOnly = true),
+              ),
+              const Spacer(),
+              const Icon(Icons.lock_outline_rounded, size: 15, color: _muted),
+              const SizedBox(width: 5),
+              const Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerRight,
+                  child: Text(
+                    'End-to-end encrypted',
+                    maxLines: 1,
+                    style: TextStyle(color: _muted, fontSize: 11),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (empty)
+            Padding(
+              padding: const EdgeInsets.only(top: 58),
+              child: _MessengerEmpty(
+                icon: hasSourceContent
+                    ? Icons.search_off_rounded
+                    : Icons.markunread_outlined,
+                title: hasSourceContent
+                    ? 'No conversations found'
+                    : 'No messages yet',
+                message: hasSourceContent
+                    ? 'Try another search or switch back to all conversations.'
+                    : 'Start a new message to begin a private conversation.',
+                actionLabel: hasSourceContent ? null : 'Start a conversation',
+                onAction: hasSourceContent ? null : _showNewChat,
+              ),
+            ),
+          for (var index = 0; index < entries.length; index++) ...[
             _ConversationTile.direct(
-              entry: entry,
+              entry: entries[index],
               enabled: !widget.connecting,
-              onTap: () => widget.onOpenChatEntry(entry),
+              onTap: () => widget.onOpenChatEntry(entries[index]),
             ),
-          for (final group in widget.groups)
+            if (index < entries.length - 1 || groups.isNotEmpty)
+              const Divider(height: 1),
+          ],
+          for (var index = 0; index < groups.length; index++) ...[
             _ConversationTile.group(
-              group: group,
+              group: groups[index],
               enabled: !widget.groupsBusy,
-              onTap: () => widget.onOpenGroup(group),
+              onTap: () => widget.onOpenGroup(groups[index]),
             ),
-          if (widget.groupsBusy && widget.groups.isEmpty)
+            if (index < groups.length - 1) const Divider(height: 1),
+          ],
+          if (widget.groupsBusy && sourceGroups.isEmpty)
             const Padding(
               padding: EdgeInsets.all(24),
               child: Center(child: CircularProgressIndicator()),
@@ -287,6 +388,18 @@ class _MessengerHomeState extends State<MessengerHome> {
     );
   }
 
+  void _showSettingsInfo(String title, String message) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => _MessengerDialog(
+        title: title,
+        actionLabel: 'Done',
+        onAction: () => Navigator.of(context).pop(),
+        child: Text(message),
+      ),
+    );
+  }
+
   Widget _settings() => ListView(
     padding: const EdgeInsets.fromLTRB(12, 16, 12, 24),
     children: [
@@ -299,9 +412,30 @@ class _MessengerHomeState extends State<MessengerHome> {
         subtitle: Text(widget.session.email),
       ),
       const Divider(),
-      const _SettingsTile(icon: Icons.person_outline, title: 'Account'),
-      const _SettingsTile(icon: Icons.lock_outline, title: 'Privacy'),
-      const _SettingsTile(icon: Icons.palette_outlined, title: 'Appearance'),
+      _SettingsTile(
+        icon: Icons.person_outline,
+        title: 'Account',
+        onTap: () => _showSettingsInfo(
+          'Account',
+          '@${widget.session.username}\n${widget.session.email}',
+        ),
+      ),
+      _SettingsTile(
+        icon: Icons.lock_outline,
+        title: 'Privacy',
+        onTap: () => _showSettingsInfo(
+          'Privacy',
+          'Messages, attachments, and group conversations are end-to-end encrypted.',
+        ),
+      ),
+      _SettingsTile(
+        icon: Icons.palette_outlined,
+        title: 'Appearance',
+        onTap: () => _showSettingsInfo(
+          'Appearance',
+          'Peep currently follows its accessible light theme.',
+        ),
+      ),
       _SettingsTile(
         icon: Icons.hub_outlined,
         title: 'Connection settings',
@@ -351,11 +485,11 @@ class _MessengerHomeState extends State<MessengerHome> {
       _ => _settings(),
     };
     return Material(
-      color: const Color(0xfff7f7f8),
+      color: Colors.white,
       child: Column(
         children: [
           Container(
-            height: 64,
+            height: 68,
             padding: const EdgeInsets.symmetric(horizontal: 16),
             color: Colors.white,
             child: Row(
@@ -364,8 +498,9 @@ class _MessengerHomeState extends State<MessengerHome> {
                   titles[_tabIndex],
                   style: const TextStyle(
                     color: _ink,
-                    fontSize: 26,
+                    fontSize: 28,
                     fontWeight: FontWeight.w800,
+                    letterSpacing: -0.6,
                   ),
                 ),
                 const Spacer(),
@@ -383,33 +518,169 @@ class _MessengerHomeState extends State<MessengerHome> {
               ],
             ),
           ),
-          const Divider(height: 1),
-          Expanded(child: body),
-          NavigationBar(
-            selectedIndex: _tabIndex,
-            onDestinationSelected: (index) => setState(() => _tabIndex = index),
-            destinations: const [
-              NavigationDestination(
-                icon: Icon(Icons.chat_bubble_outline),
-                selectedIcon: Icon(Icons.chat_bubble),
-                label: 'Chats',
+          Expanded(
+            child: Stack(
+              children: [
+                Positioned.fill(child: body),
+                if (_tabIndex == 0)
+                  Positioned(
+                    right: 20,
+                    bottom: 18,
+                    child: FloatingActionButton(
+                      tooltip: 'New message',
+                      onPressed: widget.connecting ? null : _showNewChat,
+                      backgroundColor: _primary,
+                      foregroundColor: Colors.white,
+                      elevation: 3,
+                      child: const Icon(Icons.edit_rounded),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          NavigationBarTheme(
+            data: NavigationBarThemeData(
+              iconTheme: WidgetStateProperty.resolveWith(
+                (states) => IconThemeData(
+                  color: states.contains(WidgetState.selected)
+                      ? _primary
+                      : const Color(0xff45434d),
+                  size: 24,
+                ),
               ),
-              NavigationDestination(
-                icon: Icon(Icons.call_outlined),
-                selectedIcon: Icon(Icons.call),
-                label: 'Calls',
+              labelTextStyle: WidgetStateProperty.resolveWith(
+                (states) => TextStyle(
+                  color: states.contains(WidgetState.selected)
+                      ? _primary
+                      : const Color(0xff45434d),
+                  fontSize: 12,
+                  fontWeight: states.contains(WidgetState.selected)
+                      ? FontWeight.w700
+                      : FontWeight.w500,
+                ),
               ),
-              NavigationDestination(
-                icon: Icon(Icons.person_outline),
-                selectedIcon: Icon(Icons.person),
-                label: 'Settings',
-              ),
-            ],
+            ),
+            child: NavigationBar(
+              height: 78,
+              backgroundColor: const Color(0xfff8f6ff),
+              indicatorColor: const Color(0xffe8e5ff),
+              labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+              selectedIndex: _tabIndex,
+              onDestinationSelected: (index) =>
+                  setState(() => _tabIndex = index),
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.chat_bubble_outline),
+                  selectedIcon: Icon(Icons.chat_bubble),
+                  label: 'Chats',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.call_outlined),
+                  selectedIcon: Icon(Icons.call),
+                  label: 'Calls',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.person_outline),
+                  selectedIcon: Icon(Icons.person),
+                  label: 'Settings',
+                ),
+              ],
+            ),
           ),
         ],
       ),
     );
   }
+}
+
+class _NewGroupDialog extends StatefulWidget {
+  const _NewGroupDialog({
+    required this.groupNameController,
+    required this.groupMembersController,
+    required this.onCreate,
+  });
+
+  final TextEditingController groupNameController;
+  final TextEditingController groupMembersController;
+  final Future<String?> Function() onCreate;
+
+  @override
+  State<_NewGroupDialog> createState() => _NewGroupDialogState();
+}
+
+class _NewGroupDialogState extends State<_NewGroupDialog> {
+  bool _creating = false;
+  String? _error;
+
+  Future<void> _create() async {
+    if (_creating) return;
+    setState(() {
+      _creating = true;
+      _error = null;
+    });
+    final error = await widget.onCreate();
+    if (!mounted) return;
+    if (error == null) {
+      Navigator.of(context).pop();
+      return;
+    }
+    setState(() {
+      _creating = false;
+      _error = error;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('New group'),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        TextField(
+          controller: widget.groupNameController,
+          autofocus: true,
+          enabled: !_creating,
+          textInputAction: TextInputAction.next,
+          decoration: const InputDecoration(labelText: 'Group name'),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: widget.groupMembersController,
+          minLines: 2,
+          maxLines: 3,
+          enabled: !_creating,
+          decoration: const InputDecoration(
+            labelText: 'Member usernames',
+            hintText: 'alex, maya, sam',
+            helperText: 'Separate usernames with commas',
+          ),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Semantics(
+            liveRegion: true,
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          ),
+        ],
+      ],
+    ),
+    actions: [
+      TextButton(
+        onPressed: _creating ? null : () => Navigator.of(context).pop(),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: _creating ? null : _create,
+        child: Text(_creating ? 'Creating…' : 'Create'),
+      ),
+    ],
+  );
 }
 
 class _MessengerDialog extends StatelessWidget {
@@ -442,6 +713,50 @@ class _MessengerDialog extends StatelessWidget {
   );
 }
 
+class _FilterPill extends StatelessWidget {
+  const _FilterPill({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: selected ? _MessengerHomeState._primary : Colors.white,
+    shape: StadiumBorder(
+      side: BorderSide(
+        color: selected
+            ? _MessengerHomeState._primary
+            : _MessengerHomeState._border,
+      ),
+    ),
+    child: InkWell(
+      customBorder: const StadiumBorder(),
+      onTap: onTap,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minWidth: 64, minHeight: 40),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18),
+            child: Text(
+              label,
+              style: TextStyle(
+                color: selected ? Colors.white : _MessengerHomeState._ink,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 class _ConversationTile extends StatelessWidget {
   const _ConversationTile.direct({
     required this.entry,
@@ -457,6 +772,7 @@ class _ConversationTile extends StatelessWidget {
   final GroupSummary? group;
   final bool enabled;
   final VoidCallback onTap;
+
   @override
   Widget build(BuildContext context) {
     final direct = entry != null;
@@ -466,22 +782,14 @@ class _ConversationTile extends StatelessWidget {
         : '${group!.members.length} members • Encrypted group';
     final unread = direct ? entry!.unreadCount : 0;
     return Material(
-      color: unread > 0 ? const Color(0xffeef4ff) : Colors.white,
-      borderRadius: BorderRadius.circular(14),
+      color: Colors.white,
       child: InkWell(
-        borderRadius: BorderRadius.circular(14),
         onTap: enabled ? onTap : null,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          padding: const EdgeInsets.symmetric(vertical: 14),
           child: Row(
             children: [
-              direct
-                  ? _Avatar(label: title, unread: unread > 0)
-                  : const CircleAvatar(
-                      backgroundColor: Color(0xffe9f8ef),
-                      foregroundColor: Color(0xff228a50),
-                      child: Icon(Icons.group),
-                    ),
+              _Avatar(label: title, group: !direct),
               const SizedBox(width: 13),
               Expanded(
                 child: Column(
@@ -492,6 +800,8 @@ class _ConversationTile extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
+                        color: _MessengerHomeState._ink,
+                        fontSize: 15,
                         fontWeight: unread > 0
                             ? FontWeight.w800
                             : FontWeight.w700,
@@ -503,37 +813,51 @@ class _ConversationTile extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                        color: Color(0xff687386),
+                        color: _MessengerHomeState._muted,
                         fontSize: 13,
                       ),
                     ),
                   ],
                 ),
               ),
-              if (direct) ...[
-                Text(
-                  _compactTime(entry!.updatedAt),
-                  style: const TextStyle(
-                    color: Color(0xff687386),
-                    fontSize: 11,
-                  ),
+              const SizedBox(width: 12),
+              SizedBox(
+                height: 52,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      direct
+                          ? entry!.displayTime ?? _compactTime(entry!.updatedAt)
+                          : '',
+                      style: const TextStyle(
+                        color: _MessengerHomeState._muted,
+                        fontSize: 11,
+                      ),
+                    ),
+                    if (unread > 0) ...[
+                      const SizedBox(height: 8),
+                      Container(
+                        width: 20,
+                        height: 20,
+                        alignment: Alignment.center,
+                        decoration: const BoxDecoration(
+                          color: _MessengerHomeState._primary,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Text(
+                          '$unread',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
-                if (unread > 0)
-                  Container(
-                    margin: const EdgeInsets.only(left: 8),
-                    width: 20,
-                    height: 20,
-                    alignment: Alignment.center,
-                    decoration: const BoxDecoration(
-                      color: _MessengerHomeState._primary,
-                      shape: BoxShape.circle,
-                    ),
-                    child: Text(
-                      '$unread',
-                      style: const TextStyle(color: Colors.white, fontSize: 10),
-                    ),
-                  ),
-              ],
+              ),
             ],
           ),
         ),
@@ -543,37 +867,57 @@ class _ConversationTile extends StatelessWidget {
 }
 
 class _Avatar extends StatelessWidget {
-  const _Avatar({required this.label, this.unread = false});
+  const _Avatar({required this.label, this.group = false});
+
   final String label;
-  final bool unread;
+  final bool group;
+
+  (Color, Color) get _palette {
+    if (group) {
+      return (const Color(0xfffff3d6), const Color(0xffdc9b00));
+    }
+    final normalized = label.toLowerCase();
+    if (normalized.startsWith('m')) {
+      return (const Color(0xffede9fe), const Color(0xff6d4ce8));
+    }
+    if (normalized.startsWith('a')) {
+      return (const Color(0xffe8f1ff), const Color(0xff3174e8));
+    }
+    if (normalized.startsWith('s')) {
+      return (const Color(0xffe1f7ee), const Color(0xff14a66d));
+    }
+    final first = label.isEmpty ? 0 : normalized.codeUnitAt(0);
+    return switch (first % 4) {
+      0 => (const Color(0xffede9fe), const Color(0xff6d4ce8)),
+      1 => (const Color(0xffe8f1ff), const Color(0xff3174e8)),
+      2 => (const Color(0xffe1f7ee), const Color(0xff14a66d)),
+      _ => (const Color(0xfffff3d6), const Color(0xffdc9b00)),
+    };
+  }
+
   @override
-  Widget build(BuildContext context) => Stack(
-    clipBehavior: Clip.none,
-    children: [
-      CircleAvatar(
-        backgroundColor: const Color(0xffeaf1ff),
-        foregroundColor: _MessengerHomeState._primary,
-        child: Text(
-          label.isEmpty ? '?' : label.characters.first.toUpperCase(),
-          style: const TextStyle(fontWeight: FontWeight.w800),
+  Widget build(BuildContext context) {
+    final (background, foreground) = _palette;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        CircleAvatar(
+          radius: 26,
+          backgroundColor: background,
+          foregroundColor: foreground,
+          child: group
+              ? const Icon(Icons.groups_rounded, size: 25)
+              : Text(
+                  label.isEmpty ? '?' : label.characters.first.toUpperCase(),
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
         ),
-      ),
-      if (unread)
-        Positioned(
-          right: -1,
-          bottom: -1,
-          child: Container(
-            width: 11,
-            height: 11,
-            decoration: BoxDecoration(
-              color: _MessengerHomeState._primary,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 2),
-            ),
-          ),
-        ),
-    ],
-  );
+      ],
+    );
+  }
 }
 
 class _MessengerEmpty extends StatelessWidget {
@@ -581,10 +925,16 @@ class _MessengerEmpty extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.message,
+    this.actionLabel,
+    this.onAction,
   });
+
   final IconData icon;
   final String title;
   final String message;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
   @override
   Widget build(BuildContext context) => Center(
     child: Padding(
@@ -607,8 +957,16 @@ class _MessengerEmpty extends StatelessWidget {
           Text(
             message,
             textAlign: TextAlign.center,
-            style: const TextStyle(color: Color(0xff687386)),
+            style: const TextStyle(color: _MessengerHomeState._muted),
           ),
+          if (actionLabel != null && onAction != null) ...[
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              onPressed: onAction,
+              icon: const Icon(Icons.edit_rounded, size: 18),
+              label: Text(actionLabel!),
+            ),
+          ],
         ],
       ),
     ),

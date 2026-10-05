@@ -31,11 +31,9 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
-                    ContextCompat.startForegroundService(
-                        this,
-                        Intent(this, ScreenShareService::class.java),
-                    )
-                    result.success(null)
+                    ScreenShareService.start(this) {
+                        result.success(null)
+                    }
                 }
                 "stop" -> {
                     stopService(Intent(this, ScreenShareService::class.java))
