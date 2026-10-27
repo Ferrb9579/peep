@@ -58,6 +58,7 @@ void main() {
         onRefreshGroups: () async {},
         onSignOut: () {},
         logs: const [],
+        onMediaSettings: () {},
       ),
     ),
   );
@@ -144,6 +145,23 @@ void main() {
     expect(find.text('New message'), findsOneWidget);
     expect(find.text('Username'), findsOneWidget);
     expect(find.text('Next'), findsOneWidget);
+
+    await tester.tap(find.text('Next'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Enter a valid username (3–32 characters).'),
+      findsOneWidget,
+    );
+    await tester.enterText(find.byType(TextFormField), 'audit_direct');
+    await tester.tap(find.text('Next'));
+    await tester.pumpAndSettle();
+    expect(find.text('Choose someone other than yourself.'), findsOneWidget);
+    await tester.enterText(find.byType(TextFormField), 'maya');
+    await tester.tap(find.text('Next'));
+    await tester.pumpAndSettle();
+    expect(find.text('New message'), findsNothing);
+    expect(contactController.text, 'maya');
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets(

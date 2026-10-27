@@ -1,0 +1,1 @@
+Peep QA fixture: unsupported MIME type

@@ -1,0 +1,180 @@
+PEEP — HEADED QA AND REHABILITATION REPORT
+Date: 2026-10-06
+Workspace: /home/fanisus/CODEBASE/peep
+
+PROJECT
+Flutter direct/group messaging and calling, with a Rust signaling, mailbox,
+account, group-key, and SFU engine. Direct chat uses encrypted WebRTC; groups
+use encrypted WebSocket messages and an SFU for calls. Android also supplies
+notifications, inline replies, and screen-sharing services.
+
+ENVIRONMENT
+Visible Codex browser tabs ran the actual application against an isolated Rust
+engine on 127.0.0.1:8877 and a temporary SQLite database. Three disposable QA
+accounts used separate browser origins. No production/user database was used.
+The default production entrypoint was tested for real chat and mailbox delivery.
+The separate tool/headed_qa.dart entrypoint uses the same app and transports,
+with generated camera/microphone/screen media and explicit failure modes.
+Screen-sharing follow-up used two additional disposable accounts. Temporary
+runtime files were recreated after an interrupted browser session; saved evidence
+and repository changes were retained.
+GPT-6 Luna at Max assisted with code/test auditing and synthetic-media fixtures.
+
+HEADED COVERAGE
+Authentication: sign-in/create-account tabs; empty/invalid fields; password
+visibility; valid registration/sign-in; wrong credentials; duplicate username;
+connection settings; sign-out and cleared fields. Latest duplicate error reads
+"That username is already taken. Choose another username."
+
+Inbox: new-message and empty-inbox actions; self/empty contact rejection; search,
+no results and clear; All/Unread; refresh; direct/group rows; call history;
+Settings; overflow menu and dismissal; account/privacy information; connection
+activity and dialog actions. Group creation covered empty names, no members,
+unknown members, retry, whitespace/case normalization, duplicates, and self.
+
+Direct chat: connected encrypted Unicode messages via Send and Enter; empty Send
+disabled; saved history after reload; offline mailbox delivery with unread badge;
+repeated peer departure/rejoin; call button recovery; a real signaling outage.
+A message queued while the engine was stopped survived explicit Reconnect chat
+and arrived decrypted after the engine restarted.
+
+Attachments: WAV and WebM transfers in direct/group chats; visible previews;
+native play controls; received payloads compared byte-for-byte with fixtures;
+unsupported text, zero-byte media, and 8 MiB + 1 rejected; valid retry afterward.
+Incoming truncated/oversized/malformed chunks are covered by automated tests.
+Escape dismissal and a subsequent chooser retry were exercised. The automation
+API cannot submit an empty chooser selection, so OS picker cancellation was not
+independently verified. The native media Download menu was attempted, but the
+browser did not expose a completed download event; saving to disk is unverified.
+
+Direct calls: outgoing Cancel, receiver Decline/Accept, hang-up; mute/unmute;
+camera on/off/on; screen share/stop; repeated calls; preferences during a call.
+Both local and remote video elements showed nonzero dimensions and playing
+frames. Denying the receiver's microphone returned both users to chat with a
+readable message, and a second accepted call successfully rendered video.
+
+Group calls: two- and three-person conference joining; cameras, mute/unmute,
+screen sharing/stop, hang-up; each of three clients rendered both remote cameras
+and its local preview. Hyphenated username qa-cara stayed intact. Placeholder
+tracks no longer created a ghost "Remote" participant.
+Cancel during pending startup stayed canceled. A departing participant's tile
+was removed from the remaining client's grid; rejoining restored live video
+on both clients. Ending both calls returned them to connected encrypted chat.
+
+Media preferences: all presets; codec menus and H264/Opus preference; resolution,
+frame rate, video/audio bitrate sliders, audio quality, stereo and processing
+switches; Save/Close; persisted values after reload. A separate actual WebRTC
+loopback verified codec ordering, compatible fallbacks, negotiated sender limits,
+and changing live bitrate/frame-rate limits. Every codec/device combination was
+not tested. Capture settings remain hardware-dependent requests.
+
+Responsive/recovery: desktop and actual 390 x 844 headed layouts; scrolling
+settings and reachable Save; live mobile video and call controls. Automated
+layout checks also cover 320 x 568 and enlarged text. Missing microphones leave
+direct/group calls recoverable. With audio working, missing camera/screen capture
+keeps the call usable and presents a clear message.
+
+SCREEN-SHARING FOLLOW-UP
+Independent camera/screen frame rates accept every integer from 1 through 60.
+Screen sharing has original/720p/1080p/1440p/4K resolution requests, exact bitrate
+entry from 100 through 20000 kbps, and scoped in-call quality settings.
+Start/stop, pause/resume and change-source controls are exposed in direct/group
+calls. Camera/audio bitrate also accept exact numeric entry. Preferences persist
+across reload. Invalid/empty/out-of-range entries block Save.
+Headed direct calls verified replacement screen and camera recovery on both
+clients. The actual WebRTC loopback measured three frames over three seconds at
+1 fps, zero new encoded video frames during pause, active audio encodings, resumed
+video, restored camera limits, and reuse of the negotiated video sender on source
+replacement. Narrow 320 x 568 widget checks cover all new controls and validation.
+Headed group calls rendered remote 1 fps video. A source chosen while paused
+exposed a track-registration race; the SFU now announces newly available tracks
+so subscribers refresh after the track exists.
+The corrected group flow was retested headed: choose a new source while paused,
+save scoped settings, resume, and decode the replacement screen remotely at
+480 x 270 with the configured 1 fps/777 kbps limits. Calls were then ended.
+
+FIXES FROM TESTING
+- Small-screen account/filter/compose/resolution overflows and activity-dialog
+  intrinsic-size crash.
+- Rebuilt generated web plugin registration so secure history loads correctly.
+- Readable non-2xx HTTP/authentication errors, timeouts, and duplicate accounts.
+- Draft connection edits now roll back on Cancel and validate before Done.
+- Stale socket close no longer removes/announces a replacement connection.
+- Direct peer connections are recreated after departure; queued messages survive
+  explicit reconnection to the same conversation.
+- Local video resumes when stream/participant platform views are reattached.
+- Group offers reserve audio/video receivers for every other group member.
+- Serialized group refreshes, participant labels, ignored placeholder streams.
+- SFU RTCP handling/keyframe requests improve video startup and recovery.
+- Shared attachment bounds/MIME validation; 4 KiB chunks; web typed-byte reader;
+  correct distinction between WebM video and its shared audio signature.
+- Clear capture-failure feedback and explicit audio element sizing.
+- Generation guards prevent canceled group startup from reopening the call;
+  departure announces a participant refresh. Native/web APIs stay aligned.
+- Reuse direct negotiated senders when replacing video sources; pass an explicit
+  null argument to browser replaceTrack when detaching video.
+- Screen acquisition generation guards prevent late capture after stop/teardown.
+- Full call video is fitted inside tiles; native screen previews are unmirrored.
+- Screen quality forms preserve invalid drafts and update preset fields safely.
+
+CALL EXPERIENCE FOLLOW-UP
+Incoming/outgoing calls now use dedicated ringing screens with accept/decline,
+cancel, elapsed ringing time, and distinct group-joining presentation. Completed
+calls show the outcome and duration with retry/rejoin and back-to-chat actions.
+An injectable session tracker records direction/outcome once and excludes
+ringing time from the duration. Direct unanswered calls cancel after 60 seconds.
+Direct calls use the remote tile and compact self preview; group/grid layouts
+adapt to the available space, with scrolling for large participant counts.
+Audio-only or stopped remote video renders an avatar. Native/web track changes
+refresh presentation. Tapping a video expands it in the app, with 1–4x pinch/
+scroll zoom, pan, double-tap 2x, explicit zoom/reset, Escape and system Back.
+Stopping the focused participant's video restores the normal call layout.
+
+Headed two-client checks: outgoing ringing, incoming ringing, decline on both
+peers, retry from the declined summary, accept, both cameras playing, full-screen
+remote video, zoom to 150%, reset, Escape, and matching 05:35 summaries after
+direct hang-up. Group checks covered balanced tiles, remote camera off while
+expanded (automatic return), camera restart with live video recovery, departure,
+duration summary and rejoin. At 390 x 844, video-body tap expanded the video;
+zoom controls and hang-up worked, and the completed-call actions fit the screen.
+Back to chat restored the connected encrypted conversation with Start call
+available. The final review tab is left on that conversation with no active call.
+Five added automated tests cover session outcomes, timing, repeated calls,
+video-body tap, double-tap, two-pointer pinch, reset/Escape, focused-video loss,
+scrolling eight remote participants at 320 x 568, ringing at 568 x 320, and
+ended-screen actions at 1.8x text scale. Physical touch-device gestures and the
+60-second timeout are not independently verified by this headed pass.
+The headed double-click attempt with Flutter accessibility enabled did not
+change the zoom; double-tap is verified by widget pointer events only. Explicit
+zoom controls work in the headed browser. Check the touch/browser gesture path
+on target devices before treating that gesture as production-verified.
+
+AUTOMATED VALIDATION
+flutter analyze: no issues.
+flutter test: 42 passed.
+cargo test --offline: 3 passed (atomic group validation, stale socket close,
+duplicate registration preserving the original account).
+Production Flutter web release and synthetic QA release: built successfully.
+git diff --check and Rust formatting: clean.
+
+LIMITS
+This is a broad bounded web QA pass, not proof of every possible edge case.
+Android APK validation was blocked by Maven TLS/dependency retrieval failures.
+Physical camera/microphone capture, native Android notifications/inline replies,
+OS screen pickers/download saving, Safari/Firefox, and real mobile/NAT/TURN or
+lossy production-network deployments still require device/platform testing.
+The browser build emits a Cupertino font-family warning; no application code
+uses CupertinoIcons. The synthetic harness uses dart:html and is a JS web fixture.
+
+EVIDENCE
+direct-chat.jpg, attachments.jpg, direct-call.jpg, reconnect-recovery.jpg,
+group-call.jpg, mobile-call.jpg, mobile-media-settings.jpg, media-failure.jpg,
+duplicate-account.jpg. Earlier UI gallery/loopback images are in ../ui.
+final-inbox.jpg shows the finished app left open for review, with calls ended.
+screen-quality-one-fps.jpg, screen-sharing-controls.jpg, screen-dual-sharing.jpg,
+screen-one-fps-loopback.jpg document the screen-sharing follow-up.
+screen-group-source-resumed.jpg shows the remote replacement screen after resume.
+call-ringing.jpg, call-incoming.jpg, call-full-screen-zoom.jpg,
+call-mobile-zoom.jpg, call-ended-group.jpg, call-ended-mobile.jpg document the
+call-experience follow-up.
+call-ended-final.jpg shows the final release's completed group call.

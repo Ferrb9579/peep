@@ -1,3 +1,4 @@
+import 'media/media_settings.dart';
 import 'package:flutter/widgets.dart';
 import 'dart:async';
 
@@ -18,7 +19,7 @@ Future<void> showIncomingMessageNotification({
 Stream<String> get messageNotificationTaps => const Stream.empty();
 Future<String?> takeInitialMessageNotificationContact() async => null;
 
-Widget buildPlatformMediaView(String viewType) {
+Widget buildPlatformMediaView(String viewType, {bool mirror = true}) {
   return const SizedBox.shrink();
 }
 
@@ -221,6 +222,8 @@ Future<List<StoredConversation>> listStoredDirectConversations(
 }
 
 class GroupClient {
+  Future<void> setMediaSettings(MediaSettings settings) async {}
+
   GroupClient({
     required this.onStatus,
     required this.onMessage,
@@ -237,6 +240,7 @@ class GroupClient {
   bool get cameraEnabled => false;
   bool get microphoneEnabled => false;
   bool get screenShareEnabled => false;
+  bool get screenSharePaused => false;
   CallState get callState => CallState.idle;
   bool get callActive => false;
   String? get localVideoViewType => null;
@@ -248,6 +252,7 @@ class GroupClient {
     required String token,
     required String groupId,
     required String groupKeyBase64,
+    int memberCount = 2,
   }) async {
     onStatus(PeerStatus.failed);
     onLog('Group chat is currently implemented for Flutter web builds.');
@@ -283,6 +288,8 @@ class GroupClient {
     );
   }
 
+  Future<void> setScreenSharePaused(bool paused) async {}
+
   Future<void> setScreenShareEnabled(bool enabled) async {
     onLog('Group screen sharing is only available in Flutter web builds.');
   }
@@ -293,6 +300,8 @@ class GroupClient {
 }
 
 class PeerClient {
+  Future<void> setMediaSettings(MediaSettings settings) async {}
+
   PeerClient({
     required this.onStatus,
     required this.onMessage,
@@ -310,6 +319,7 @@ class PeerClient {
   bool get cameraEnabled => false;
   bool get microphoneEnabled => false;
   bool get screenShareEnabled => false;
+  bool get screenSharePaused => false;
   bool get encryptionReady => false;
   CallState get callState => CallState.idle;
   bool get callActive => false;
@@ -344,6 +354,8 @@ class PeerClient {
     onLog('Microphone controls are only available in Flutter web builds.');
   }
 
+  Future<void> setScreenSharePaused(bool paused) async {}
+
   Future<void> setScreenShareEnabled(bool enabled) async {
     onLog('Screen sharing is only available in Flutter web builds.');
   }
@@ -368,3 +380,6 @@ class PeerClient {
     onStatus(PeerStatus.disconnected);
   }
 }
+
+Future<MediaCodecSupport> discoverMediaCodecs() async =>
+    const MediaCodecSupport();

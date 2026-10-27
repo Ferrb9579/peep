@@ -14,7 +14,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
-import 'package:mime/mime.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,11 +21,47 @@ import 'package:video_player/video_player.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'storage/encrypted_store.dart';
+import 'models/conversation_id.dart';
+import 'models/attachment_payload.dart';
+import 'media/media_settings.dart';
+import 'media/webrtc_media_native.dart';
 
 late SharedPreferencesWithCache _preferences;
 final Map<String, RTCVideoRenderer> _videoRenderers = {};
 final Map<String, AttachmentData> _attachmentViews = {};
 int _nextNativeViewId = 0;
+
+Future<Uint8List> _readPickedAttachmentBytes(fp.PlatformFile file) async {
+  final readStream = file.readStream;
+  if (readStream != null) return _collectAttachmentBytes(readStream);
+  final bytes = file.bytes;
+  if (bytes != null) {
+    validateAttachmentSize(bytes.length);
+    return bytes;
+  }
+  final path = file.path;
+  if (path == null) {
+    throw StateError('Could not read the selected attachment.');
+  }
+  final source = File(path);
+  validateAttachmentSize(await source.length());
+  return _collectAttachmentBytes(source.openRead());
+}
+
+Future<Uint8List> _collectAttachmentBytes(Stream<List<int>> stream) async {
+  final builder = BytesBuilder(copy: false);
+  var totalBytes = 0;
+  await for (final chunk in stream) {
+    totalBytes += chunk.length;
+    if (totalBytes > maxAttachmentBytes) {
+      throw StateError('Attachments must be 8 MiB or smaller.');
+    }
+    builder.add(chunk);
+  }
+  final bytes = builder.takeBytes();
+  validateAttachmentSize(bytes.length);
+  return bytes;
+}
 
 Future<void> initializePlatformServices() async {
   _preferences = await SharedPreferencesWithCache.create(
@@ -63,13 +98,18 @@ final _messageNotificationTapController = StreamController<String>.broadcast();
 Stream<String> get messageNotificationTaps =>
     _messageNotificationTapController.stream;
 
-Future<String?> takeInitialMessageNotificationContact() =>
-    _messageNotificationChannel.invokeMethod<String>('takeInitialContact');
+Future<String?> takeInitialMessageNotificationContact() async =>
+    Platform.isAndroid
+    ? await _messageNotificationChannel.invokeMethod<String>(
+        'takeInitialContact',
+      )
+    : null;
 
 Future<void> startMessageNotifications({
   required Uri signalingUri,
   required AuthSession session,
 }) async {
+  if (!Platform.isAndroid) return;
   final permission = await Permission.notification.request();
   if (!permission.isGranted) return;
   final watchUri = signalingUri.replace(
@@ -86,24 +126,30 @@ Future<void> startMessageNotifications({
   });
 }
 
-Future<void> stopMessageNotifications() =>
-    _messageNotificationChannel.invokeMethod<void>('stop');
+Future<void> stopMessageNotifications() async {
+  if (Platform.isAndroid) {
+    await _messageNotificationChannel.invokeMethod<void>('stop');
+  }
+}
 
 Future<void> showIncomingMessageNotification({
   required String contact,
   required String preview,
-}) => _messageNotificationChannel.invokeMethod<void>('showIncomingMessage', {
-  'contact': contact,
-  'preview': preview,
-});
+}) async {
+  if (!Platform.isAndroid) return;
+  await _messageNotificationChannel.invokeMethod<void>('showIncomingMessage', {
+    'contact': contact,
+    'preview': preview,
+  });
+}
 
-Widget buildPlatformMediaView(String viewType) {
+Widget buildPlatformMediaView(String viewType, {bool mirror = true}) {
   final renderer = _videoRenderers[viewType];
   if (renderer != null) {
     return RTCVideoView(
       renderer,
-      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-      mirror: viewType.contains('local'),
+      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+      mirror: mirror && viewType.contains('local'),
     );
   }
   final attachment = _attachmentViews[viewType];
@@ -124,6 +170,12 @@ enum PeerStatus {
   disconnected,
   failed,
 }
+
+bool _hasLiveVideo(MediaStream? stream) =>
+    stream?.getVideoTracks().any(
+      (track) => track.enabled && track.muted != true,
+    ) ==
+    true;
 
 enum CallState { idle, outgoing, incoming, active }
 
@@ -881,25 +933,6 @@ AttachmentData _registerAttachment(AttachmentData attachment) {
   return registered;
 }
 
-String _directRoom(String first, String second) {
-  final a = first.trim().toLowerCase();
-  final b = second.trim().toLowerCase();
-  return a.compareTo(b) <= 0 ? 'dm:$a:$b' : 'dm:$b:$a';
-}
-
-class _IncomingAttachment {
-  _IncomingAttachment({
-    required this.name,
-    required this.mimeType,
-    required this.size,
-  });
-
-  final String name;
-  final String mimeType;
-  final int size;
-  final StringBuffer data = StringBuffer();
-}
-
 class _RemoteNativeView {
   const _RemoteNativeView({
     required this.title,
@@ -915,6 +948,33 @@ class _RemoteNativeView {
 }
 
 class GroupClient {
+  MediaSettings _mediaSettings = MediaSettings.defaults;
+  Future<void> setMediaSettings(MediaSettings settings) async {
+    _mediaSettings = settings;
+    final connection = _publisherConnection;
+    if (connection != null) {
+      await applyNativeSenderLimits(
+        connection,
+        settings,
+        screenSharing: _screenShareEnabled,
+        screenPaused: _screenSharePaused,
+      );
+    }
+  }
+
+  Future<void> _applySenderLimits(RTCPeerConnection connection) async {
+    try {
+      await applyNativeSenderLimits(
+        connection,
+        _mediaSettings,
+        screenSharing: _screenShareEnabled,
+        screenPaused: _screenSharePaused,
+      );
+    } catch (error) {
+      onLog('Could not apply media limits: $error');
+    }
+  }
+
   GroupClient({
     required this.onStatus,
     required this.onMessage,
@@ -949,22 +1009,33 @@ class GroupClient {
   bool _cameraEnabled = false;
   bool _microphoneEnabled = false;
   bool _screenShareEnabled = false;
+  bool _screenSharePaused = false;
+  int _screenCaptureGeneration = 0;
   bool _conferenceRefreshQueued = false;
+  bool _conferenceRefreshInProgress = false;
+  int _remoteParticipantCount = 1;
+  int _conferenceGeneration = 0;
   CallState _callState = CallState.idle;
-  final Map<String, _IncomingAttachment> _incomingAttachments = {};
-  static const int _attachmentChunkSize = 4 * 1024;
+  final Map<String, IncomingAttachmentPayload> _incomingAttachments = {};
+  static const int _attachmentChunkSize = attachmentChunkChars;
 
   bool get canSend => _socketOpen;
   bool get cameraEnabled => _cameraEnabled;
   bool get microphoneEnabled => _microphoneEnabled;
   bool get screenShareEnabled => _screenShareEnabled;
+  bool get screenSharePaused => _screenShareEnabled && _screenSharePaused;
   CallState get callState => _callState;
   bool get callActive => _callState != CallState.idle;
   String get localVideoViewType => _localViewType;
   String? get remoteVideoViewType =>
       _remoteViews.isEmpty ? null : _remoteViews.values.first.viewType;
   List<MediaView> get remoteVideoViews => _remoteViews.values
-      .map((view) => MediaView(title: view.title, viewType: view.viewType))
+      .map(
+        (view) => MediaView(
+          title: view.title,
+          viewType: _hasLiveVideo(view.stream) ? view.viewType : null,
+        ),
+      )
       .toList(growable: false);
 
   Future<void> connect({
@@ -972,8 +1043,10 @@ class GroupClient {
     required String token,
     required String groupId,
     required String groupKeyBase64,
+    int memberCount = 2,
   }) async {
     await disconnect();
+    _remoteParticipantCount = memberCount > 1 ? memberCount - 1 : 1;
     _closed = false;
     _incomingAttachments.clear();
     _groupKey = SecretKey(base64Decode(groupKeyBase64));
@@ -1006,24 +1079,19 @@ class GroupClient {
     final result = await fp.FilePicker.platform.pickFiles(
       type: fp.FileType.media,
       allowMultiple: false,
-      withData: true,
+      withData: false,
+      withReadStream: true,
     );
     if (result == null || result.files.isEmpty) return;
     final file = result.files.single;
-    final bytes =
-        file.bytes ??
-        (file.path == null ? null : await File(file.path!).readAsBytes());
-    if (bytes == null) {
-      onLog('Could not read attachment.');
-      return;
-    }
-    final mimeType =
-        lookupMimeType(file.name, headerBytes: bytes) ??
-        'application/octet-stream';
-    if (!mimeType.startsWith('audio/') && !mimeType.startsWith('video/')) {
-      onLog('Choose an audio or video file.');
-      return;
-    }
+    validateAttachmentSize(file.size);
+    final bytes = await _readPickedAttachmentBytes(file);
+    final mimeType = resolveAttachmentMimeType(name: file.name, bytes: bytes);
+    validateAttachmentMetadata(
+      name: file.name,
+      mimeType: mimeType,
+      size: bytes.length,
+    );
     final attachment = _registerAttachment(
       AttachmentData(
         name: file.name,
@@ -1056,6 +1124,7 @@ class GroupClient {
     _conferenceSignalingUri = signalingUri;
     _conferenceToken = token;
     _conferenceGroupId = groupId;
+    final generation = ++_conferenceGeneration;
     _callState = CallState.outgoing;
     onMediaChanged();
     try {
@@ -1064,17 +1133,22 @@ class GroupClient {
         path: '/api/groups/conference/start',
         body: {'token': token, 'groupId': groupId},
       );
+      if (generation != _conferenceGeneration || _closed) return;
       if (conference['mode'] is String) {
         onLog('Group conference mode: ${conference['mode']}.');
       }
       await _ensureLocalMedia(audio: true, video: false);
+      if (generation != _conferenceGeneration || _closed) return;
       await _joinPublisher();
+      if (generation != _conferenceGeneration || _closed) return;
       await _joinSubscriber();
+      if (generation != _conferenceGeneration || _closed) return;
       _publishConferenceRefresh();
       _callState = CallState.active;
       onLog('Group call started.');
       onMediaChanged();
     } catch (error) {
+      if (generation != _conferenceGeneration || _closed) return;
       await _stopConferenceMedia(notifyServer: true);
       onLog('Could not start group call: $error');
     }
@@ -1087,6 +1161,7 @@ class GroupClient {
   }
 
   Future<void> setCameraEnabled(bool enabled) async {
+    _screenCaptureGeneration++;
     if (_callState != CallState.active) {
       onLog('Start a group call before turning on video.');
       return;
@@ -1111,9 +1186,11 @@ class GroupClient {
       return;
     }
     if (!enabled) {
+      final wasScreenSharing = _screenShareEnabled;
       final stopped = await _stopLocalVideoTracks();
       _cameraEnabled = false;
       _screenShareEnabled = false;
+      if (wasScreenSharing) await _stopScreenShareService();
       if (stopped) {
         await _joinPublisher();
         _publishConferenceRefresh();
@@ -1157,15 +1234,39 @@ class GroupClient {
     onMediaChanged();
   }
 
+  Future<void> setScreenSharePaused(bool paused) async {
+    if (!_screenShareEnabled || _callState != CallState.active) return;
+    final connection = _publisherConnection;
+    if (connection == null) return;
+    try {
+      await applyNativeSenderLimits(
+        connection,
+        _mediaSettings,
+        screenSharing: true,
+        screenPaused: paused,
+      );
+      _screenSharePaused = paused;
+      for (final track
+          in _localStream?.getVideoTracks() ?? <MediaStreamTrack>[]) {
+        track.enabled = !paused;
+      }
+      onLog(paused ? 'Screen sharing paused.' : 'Screen sharing resumed.');
+      onMediaChanged();
+    } catch (error) {
+      onLog('Could not update screen sharing: $error');
+    }
+  }
+
   Future<void> setScreenShareEnabled(bool enabled) async {
     if (_callState != CallState.active) {
       onLog('Start a group call before sharing your screen.');
       return;
     }
+    final generation = ++_screenCaptureGeneration;
     if (!enabled) {
+      final stopped = await _stopLocalVideoTracks();
       _screenShareEnabled = false;
       _cameraEnabled = false;
-      final stopped = await _stopLocalVideoTracks();
       await _stopScreenShareService();
       if (stopped) {
         await _joinPublisher();
@@ -1177,28 +1278,49 @@ class GroupClient {
     }
     try {
       await _prepareAndroidScreenShare();
-      await _stopLocalVideoTracks();
       final screen = await navigator.mediaDevices.getDisplayMedia({
         'audio': false,
-        'video': true,
+        'video': nativeScreenConstraints(_mediaSettings),
       });
-      _localStream ??= await createLocalMediaStream('peep-group-local');
-      for (final track in screen.getVideoTracks()) {
+      final tracks = screen.getVideoTracks();
+      if (generation != _screenCaptureGeneration ||
+          _closed ||
+          _callState != CallState.active) {
+        for (final track in tracks) {
+          await track.stop();
+        }
+        return;
+      }
+      if (tracks.isEmpty) {
+        throw StateError('No screen video track was selected.');
+      }
+      final paused = screenSharePaused;
+      await _stopLocalVideoTracks();
+      _localStream ??= await createLocalMediaStream('peep-screen-local');
+      for (final track in tracks) {
         await _localStream!.addTrack(track);
+        track.enabled = !paused;
         track.onEnded = () {
-          if (_screenShareEnabled) unawaited(setScreenShareEnabled(false));
+          if (_screenShareEnabled &&
+              _localStream?.getVideoTracks().any(
+                    (current) => current.id == track.id,
+                  ) ==
+                  true) {
+            unawaited(setScreenShareEnabled(false));
+          }
         };
       }
       _localRenderer.srcObject = _localStream;
       _screenShareEnabled = true;
+      _screenSharePaused = paused;
       _cameraEnabled = false;
       await _joinPublisher();
       _publishConferenceRefresh();
       onLog('Screen sharing started.');
       onMediaChanged();
     } catch (error) {
-      _screenShareEnabled = false;
-      await _stopScreenShareService();
+      if (generation != _screenCaptureGeneration) return;
+      if (!_screenShareEnabled) await _stopScreenShareService();
       onLog('Could not share screen: $error');
       onMediaChanged();
     }
@@ -1338,6 +1460,18 @@ class GroupClient {
   }
 
   Future<void> _sendAttachment(AttachmentData attachment) async {
+    validateAttachmentMetadata(
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    );
+    if (!isValidAttachmentDataUrl(
+      dataUrl: attachment.dataUrl,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    )) {
+      throw StateError('Could not prepare the selected attachment.');
+    }
     final id = 'group-attachment-${DateTime.now().microsecondsSinceEpoch}';
     await _sendEncrypted({
       'kind': 'group-attachment-start',
@@ -1372,10 +1506,21 @@ class GroupClient {
         payload['size'] is! int) {
       return;
     }
-    _incomingAttachments[payload['id'] as String] = _IncomingAttachment(
-      name: payload['name'] as String,
-      mimeType: payload['mimeType'] as String,
-      size: payload['size'] as int,
+    final id = payload['id'] as String;
+    final name = payload['name'] as String;
+    final mimeType = normalizeAttachmentMimeType(payload['mimeType'] as String);
+    final size = payload['size'] as int;
+    if (id.isEmpty || id.length > 128) return;
+    try {
+      validateAttachmentMetadata(name: name, mimeType: mimeType, size: size);
+    } on StateError {
+      onLog('Discarded an invalid or oversized group attachment.');
+      return;
+    }
+    _incomingAttachments[id] = IncomingAttachmentPayload(
+      name: name,
+      mimeType: mimeType,
+      size: size,
     );
     onLog('Receiving group attachment: ${payload['name']}.');
   }
@@ -1384,7 +1529,11 @@ class GroupClient {
     final id = payload['id'];
     final data = payload['data'];
     if (id is String && data is String) {
-      _incomingAttachments[id]?.data.write(data);
+      final incoming = _incomingAttachments[id];
+      if (incoming != null && !incoming.appendChunk(data)) {
+        _incomingAttachments.remove(id);
+        onLog('Discarded an invalid group attachment chunk.');
+      }
     }
   }
 
@@ -1393,12 +1542,17 @@ class GroupClient {
     if (id is! String) return;
     final incoming = _incomingAttachments.remove(id);
     if (incoming == null) return;
+    final dataUrl = incoming.takeValidatedDataUrl();
+    if (dataUrl == null) {
+      onLog('Discarded an incomplete or invalid group attachment.');
+      return;
+    }
     final attachment = _registerAttachment(
       AttachmentData(
         name: incoming.name,
         mimeType: incoming.mimeType,
         size: incoming.size,
-        dataUrl: incoming.data.toString(),
+        dataUrl: dataUrl,
       ),
     );
     onMessage(
@@ -1417,16 +1571,22 @@ class GroupClient {
     required bool audio,
     required bool video,
   }) async {
+    final generation = _conferenceGeneration;
     final needsAudio = audio && _localStream?.getAudioTracks().isEmpty != false;
     final needsVideo = video && _localStream?.getVideoTracks().isEmpty != false;
     if (!needsAudio && !needsVideo) return;
     await _requestMediaPermissions(audio: needsAudio, video: needsVideo);
     final stream = await navigator.mediaDevices.getUserMedia({
-      'audio': needsAudio,
-      'video': needsVideo
-          ? {'width': 1280, 'height': 720, 'facingMode': 'user'}
-          : false,
+      'audio': needsAudio ? nativeAudioConstraints(_mediaSettings) : false,
+      'video': needsVideo ? nativeVideoConstraints(_mediaSettings) : false,
     });
+    if (generation != _conferenceGeneration || _closed) {
+      for (final track in stream.getTracks()) {
+        await track.stop();
+      }
+      await stream.dispose();
+      return;
+    }
     _localStream ??= await createLocalMediaStream('peep-group-local');
     for (final track in stream.getTracks()) {
       await _localStream!.addTrack(track);
@@ -1438,6 +1598,7 @@ class GroupClient {
   }
 
   Future<bool> _stopLocalVideoTracks() async {
+    _screenSharePaused = false;
     final stream = _localStream;
     final tracks = List<MediaStreamTrack>.from(
       stream?.getVideoTracks() ?? const [],
@@ -1471,14 +1632,16 @@ class GroupClient {
     await _subscriberConnection?.close();
     await _clearRemoteViews();
     _subscriberConnection = pc;
-    await pc.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-    );
-    await pc.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
-      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-    );
+    for (var i = 0; i < _remoteParticipantCount; i++) {
+      await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+      await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+    }
     await _negotiateSfu(role: 'subscriber', connection: pc);
   }
 
@@ -1490,6 +1653,11 @@ class GroupClient {
       'sdpSemantics': 'unified-plan',
     });
     pc.onConnectionState = (state) {
+      if (_closed ||
+          !identical(pc, _publisherConnection) &&
+              !identical(pc, _subscriberConnection)) {
+        return;
+      }
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
         onStatus(PeerStatus.connected);
       } else if (state ==
@@ -1502,13 +1670,23 @@ class GroupClient {
     pc.onIceConnectionState = (state) =>
         onLog('Group call $label ICE state: $state');
     pc.onTrack = (event) {
+      if (label != 'subscriber' ||
+          !identical(pc, _subscriberConnection) ||
+          event.streams.isEmpty) {
+        return;
+      }
       if (event.track.kind == 'audio') return;
+      if (!event.streams.first.id.startsWith('sfu-$_conferenceGroupId-')) {
+        return;
+      }
       unawaited(_attachRemoteGroupTrack(event));
     };
     return pc;
   }
 
   Future<void> _attachRemoteGroupTrack(RTCTrackEvent event) async {
+    event.track.onMute = onMediaChanged;
+    event.track.onUnMute = onMediaChanged;
     final stream = event.streams.isNotEmpty
         ? event.streams.first
         : await createLocalMediaStream('peep-group-remote');
@@ -1538,6 +1716,8 @@ class GroupClient {
   }
 
   String _remoteTitleForStream(String id) {
+    final prefix = 'sfu-$_conferenceGroupId-';
+    if (id.startsWith(prefix)) return id.substring(prefix.length);
     if (id.startsWith('sfu-')) {
       final separator = id.lastIndexOf('-');
       if (separator > 0 && separator < id.length - 1) {
@@ -1557,8 +1737,10 @@ class GroupClient {
     if (uri == null || token == null || groupId == null) {
       throw StateError('Group conference is not initialized.');
     }
+    await applyNativeCodecPreferences(connection, _mediaSettings, onLog);
     final offer = await connection.createOffer();
     await connection.setLocalDescription(offer);
+    await _applySenderLimits(connection);
     await _waitForIceGatheringComplete(connection);
     final local = await connection.getLocalDescription();
     final decoded = await _postJson(
@@ -1581,6 +1763,7 @@ class GroupClient {
         answer['type'] as String?,
       ),
     );
+    await _applySenderLimits(connection);
   }
 
   Future<void> _waitForIceGatheringComplete(RTCPeerConnection pc) async {
@@ -1609,11 +1792,18 @@ class GroupClient {
   }
 
   Future<void> _refreshConference() async {
+    if (_conferenceRefreshInProgress) {
+      _scheduleConferenceRefresh();
+      return;
+    }
+    _conferenceRefreshInProgress = true;
     try {
       await _joinSubscriber();
       onMediaChanged();
     } catch (error) {
       onLog('Could not refresh group call: $error');
+    } finally {
+      _conferenceRefreshInProgress = false;
     }
   }
 
@@ -1630,6 +1820,9 @@ class GroupClient {
   }
 
   Future<void> _stopConferenceMedia({required bool notifyServer}) async {
+    _conferenceGeneration++;
+    _screenCaptureGeneration++;
+    _screenSharePaused = false;
     final wasScreenSharing = _screenShareEnabled;
     _conferenceRefreshTimer?.cancel();
     _conferenceRefreshTimer = null;
@@ -1669,6 +1862,7 @@ class GroupClient {
       } catch (error) {
         onLog('Could not close group call session: $error');
       }
+      _publishConferenceRefresh();
     }
     _conferenceSignalingUri = null;
     _conferenceToken = null;
@@ -1678,6 +1872,33 @@ class GroupClient {
 }
 
 class PeerClient {
+  MediaSettings _mediaSettings = MediaSettings.defaults;
+  Future<void> setMediaSettings(MediaSettings settings) async {
+    _mediaSettings = settings;
+    final connection = _peerConnection;
+    if (connection != null) {
+      await applyNativeSenderLimits(
+        connection,
+        settings,
+        screenSharing: _screenShareEnabled,
+        screenPaused: _screenSharePaused,
+      );
+    }
+  }
+
+  Future<void> _applySenderLimits(RTCPeerConnection connection) async {
+    try {
+      await applyNativeSenderLimits(
+        connection,
+        _mediaSettings,
+        screenSharing: _screenShareEnabled,
+        screenPaused: _screenSharePaused,
+      );
+    } catch (error) {
+      onLog('Could not apply media limits: $error');
+    }
+  }
+
   PeerClient({
     required this.onStatus,
     required this.onMessage,
@@ -1711,7 +1932,7 @@ class PeerClient {
   final List<Map<String, dynamic>> _pendingCandidates = [];
   final List<String> _pendingMessages = [];
   final List<Map<String, dynamic>> _pendingEncryptedPayloads = [];
-  final Map<String, _IncomingAttachment> _incomingAttachments = {};
+  final Map<String, IncomingAttachmentPayload> _incomingAttachments = {};
   EcKeyPair? _privateKey;
   SecretKey? _aesKey;
   String? _contactUsername;
@@ -1723,14 +1944,20 @@ class PeerClient {
   bool _remoteDescriptionSet = false;
   bool _offerStarted = false;
   bool _closed = false;
+  Future<void> _peerConnectionReady = Future<void>.value();
+  Future<void> _signalTail = Future<void>.value();
+  int _peerConnectionResetGeneration = 0;
+  int _socketGeneration = 0;
   bool _cameraEnabled = false;
   bool _microphoneEnabled = false;
   bool _screenShareEnabled = false;
+  bool _screenSharePaused = false;
+  int _screenCaptureGeneration = 0;
   CallState _callState = CallState.idle;
   // The encrypted JSON envelope expands each chunk substantially (JSON +
   // AES-GCM tag + base64). Keep the source chunk comfortably below mobile
   // WebRTC/SCTP message limits so an attachment cannot tear down the channel.
-  static const int _attachmentChunkSize = 4 * 1024;
+  static const int _attachmentChunkSize = attachmentChunkChars;
 
   bool get canSend =>
       _dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen;
@@ -1739,11 +1966,13 @@ class PeerClient {
   bool get cameraEnabled => _cameraEnabled;
   bool get microphoneEnabled => _microphoneEnabled;
   bool get screenShareEnabled => _screenShareEnabled;
+  bool get screenSharePaused => _screenShareEnabled && _screenSharePaused;
   bool get encryptionReady => _aesKey != null;
   CallState get callState => _callState;
   bool get callActive => _callState != CallState.idle;
   String get localVideoViewType => _localViewType;
-  String get remoteVideoViewType => _remoteViewType;
+  String? get remoteVideoViewType =>
+      _hasLiveVideo(_remoteStream) ? _remoteViewType : null;
 
   Future<void> connect({
     required Uri signalingUri,
@@ -1753,32 +1982,34 @@ class PeerClient {
     String? accountUsername,
     String? contactUsername,
   }) async {
+    final effectiveRoom = accountUsername != null && contactUsername != null
+        ? directConversationId(accountUsername, contactUsername)
+        : room.trim();
+    final pendingMessages =
+        _roomKeyStorageKey == 'peep:e2ee-room:$effectiveRoom'
+        ? List<String>.of(_pendingMessages)
+        : const <String>[];
     await disconnect();
     _closed = false;
+    final peerConnectionGeneration = ++_peerConnectionResetGeneration;
+    _socketGeneration++;
     _remoteDescriptionSet = false;
     _offerStarted = false;
     _pendingCandidates.clear();
-    _pendingMessages.clear();
+    _pendingMessages
+      ..clear()
+      ..addAll(pendingMessages);
     _pendingEncryptedPayloads.clear();
     _incomingAttachments.clear();
     _pendingEncryptionKey = null;
     _encryptionHandshakeStarted = false;
     _e2eePublicKey = null;
-    final effectiveRoom = accountUsername != null && contactUsername != null
-        ? _directRoom(accountUsername, contactUsername)
-        : room.trim();
     _roomKeyStorageKey = 'peep:e2ee-room:$effectiveRoom';
     _contactUsername = contactUsername?.trim().toLowerCase();
     await _loadPersistedRoomKey();
     onStatus(PeerStatus.signaling);
-    _peerConnection = await createPeerConnection({
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
-      ],
-      'sdpSemantics': 'unified-plan',
-    });
-    _wirePeerConnection();
-    _peerConnection!.onDataChannel = _attachDataChannel;
+    _peerConnectionReady = _createPeerConnection(peerConnectionGeneration);
+    await _peerConnectionReady;
     final url = signalingUri.replace(
       queryParameters: {
         ...signalingUri.queryParameters,
@@ -1812,24 +2043,19 @@ class PeerClient {
     final result = await fp.FilePicker.platform.pickFiles(
       type: fp.FileType.media,
       allowMultiple: false,
-      withData: true,
+      withData: false,
+      withReadStream: true,
     );
     if (result == null || result.files.isEmpty) return;
     final file = result.files.single;
-    final bytes =
-        file.bytes ??
-        (file.path == null ? null : await File(file.path!).readAsBytes());
-    if (bytes == null) {
-      onLog('Could not read attachment.');
-      return;
-    }
-    final mimeType =
-        lookupMimeType(file.name, headerBytes: bytes) ??
-        'application/octet-stream';
-    if (!mimeType.startsWith('audio/') && !mimeType.startsWith('video/')) {
-      onLog('Choose an audio or video file.');
-      return;
-    }
+    validateAttachmentSize(file.size);
+    final bytes = await _readPickedAttachmentBytes(file);
+    final mimeType = resolveAttachmentMimeType(name: file.name, bytes: bytes);
+    validateAttachmentMetadata(
+      name: file.name,
+      mimeType: mimeType,
+      size: bytes.length,
+    );
     final dataUrl = 'data:$mimeType;base64,${base64Encode(bytes)}';
     final attachment = _registerAttachment(
       AttachmentData(
@@ -1896,6 +2122,7 @@ class PeerClient {
   }
 
   Future<void> setCameraEnabled(bool enabled) async {
+    _screenCaptureGeneration++;
     if (_callState != CallState.active) {
       onLog('Start a call before turning on video.');
       return;
@@ -1922,9 +2149,11 @@ class PeerClient {
       return;
     }
     if (!enabled) {
+      final wasScreenSharing = _screenShareEnabled;
       final stopped = await _stopLocalVideoTracks();
       _cameraEnabled = false;
       _screenShareEnabled = false;
+      if (wasScreenSharing) await _stopScreenShareService();
       if (stopped) await _createAndSendOffer();
       onLog('Camera turned off.');
       onMediaChanged();
@@ -1964,45 +2193,92 @@ class PeerClient {
     onMediaChanged();
   }
 
+  Future<void> setScreenSharePaused(bool paused) async {
+    if (!_screenShareEnabled || _callState != CallState.active) return;
+    final connection = _peerConnection;
+    if (connection == null) return;
+    try {
+      await applyNativeSenderLimits(
+        connection,
+        _mediaSettings,
+        screenSharing: true,
+        screenPaused: paused,
+      );
+      _screenSharePaused = paused;
+      for (final track
+          in _localStream?.getVideoTracks() ?? <MediaStreamTrack>[]) {
+        track.enabled = !paused;
+      }
+      onLog(paused ? 'Screen sharing paused.' : 'Screen sharing resumed.');
+      onMediaChanged();
+    } catch (error) {
+      onLog('Could not update screen sharing: $error');
+    }
+  }
+
   Future<void> setScreenShareEnabled(bool enabled) async {
     if (_callState != CallState.active) {
       onLog('Start a call before sharing your screen.');
       return;
     }
+    final generation = ++_screenCaptureGeneration;
     if (!enabled) {
+      final stopped = await _stopLocalVideoTracks();
       _screenShareEnabled = false;
       _cameraEnabled = false;
-      final stopped = await _stopLocalVideoTracks();
       await _stopScreenShareService();
-      if (stopped) await _createAndSendOffer();
+      if (stopped) {
+        await _createAndSendOffer();
+      }
       onLog('Screen sharing stopped.');
       onMediaChanged();
       return;
     }
     try {
       await _prepareAndroidScreenShare();
-      await _stopLocalVideoTracks();
       final screen = await navigator.mediaDevices.getDisplayMedia({
         'audio': false,
-        'video': true,
+        'video': nativeScreenConstraints(_mediaSettings),
       });
-      _localStream ??= await createLocalMediaStream('peep-local');
-      for (final track in screen.getVideoTracks()) {
+      final tracks = screen.getVideoTracks();
+      if (generation != _screenCaptureGeneration ||
+          _closed ||
+          _callState != CallState.active) {
+        for (final track in tracks) {
+          await track.stop();
+        }
+        return;
+      }
+      if (tracks.isEmpty) {
+        throw StateError('No screen video track was selected.');
+      }
+      final paused = screenSharePaused;
+      await _stopLocalVideoTracks();
+      _localStream ??= await createLocalMediaStream('peep-screen-local');
+      for (final track in tracks) {
         await _localStream!.addTrack(track);
-        await _peerConnection!.addTrack(track, _localStream!);
+        await attachNativeMediaTrack(_peerConnection!, _localStream!, track);
+        track.enabled = !paused;
         track.onEnded = () {
-          if (_screenShareEnabled) unawaited(setScreenShareEnabled(false));
+          if (_screenShareEnabled &&
+              _localStream?.getVideoTracks().any(
+                    (current) => current.id == track.id,
+                  ) ==
+                  true) {
+            unawaited(setScreenShareEnabled(false));
+          }
         };
       }
       _localRenderer.srcObject = _localStream;
       _screenShareEnabled = true;
+      _screenSharePaused = paused;
       _cameraEnabled = false;
       await _createAndSendOffer();
       onLog('Screen sharing started.');
       onMediaChanged();
     } catch (error) {
-      _screenShareEnabled = false;
-      await _stopScreenShareService();
+      if (generation != _screenCaptureGeneration) return;
+      if (!_screenShareEnabled) await _stopScreenShareService();
       onLog('Could not share screen: $error');
       onMediaChanged();
     }
@@ -2010,9 +2286,22 @@ class PeerClient {
 
   Future<void> disconnect() async {
     _closed = true;
+    _peerConnectionResetGeneration++;
+    _socketGeneration++;
+    final pendingPeerConnection = _peerConnectionReady;
+    try {
+      await pendingPeerConnection;
+    } catch (_) {
+      // Disconnect should still release the signaling socket and media if a
+      // peer connection setup was already failing.
+    }
     final wasScreenSharing = _screenShareEnabled;
-    await _dataChannel?.close();
-    await _peerConnection?.close();
+    final dataChannel = _dataChannel;
+    final peerConnection = _peerConnection;
+    _dataChannel = null;
+    _peerConnection = null;
+    await dataChannel?.close();
+    await peerConnection?.close();
     await _socketSubscription?.cancel();
     await _socket?.sink.close();
     for (final track in _localStream?.getTracks() ?? <MediaStreamTrack>[]) {
@@ -2045,20 +2334,41 @@ class PeerClient {
     _encryptionHandshakeStarted = false;
     _roomKeyStorageKey = null;
     _contactUsername = null;
+    _peerConnectionReady = Future<void>.value();
     onStatus(PeerStatus.disconnected);
     onMediaChanged();
   }
 
-  void _wirePeerConnection() {
-    final pc = _peerConnection!;
+  Future<void> _createPeerConnection(int generation) async {
+    final pc = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ],
+      'sdpSemantics': 'unified-plan',
+    });
+    if (_closed || generation != _peerConnectionResetGeneration) {
+      await pc.close();
+      return;
+    }
+    _peerConnection = pc;
+    _wirePeerConnection(pc);
+    pc.onDataChannel = (channel) {
+      if (identical(_peerConnection, pc)) _attachDataChannel(channel);
+    };
+  }
+
+  void _wirePeerConnection(RTCPeerConnection pc) {
     pc.onIceCandidate = (candidate) {
-      if (candidate.candidate == null) return;
+      if (!identical(_peerConnection, pc) || candidate.candidate == null) {
+        return;
+      }
       _sendSignal({'type': 'candidate', 'candidate': candidate.toMap()});
     };
     pc.onConnectionState = (state) {
+      if (!identical(_peerConnection, pc)) return;
       switch (state) {
         case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
-          onStatus(PeerStatus.connected);
+          if (canSend) onStatus(PeerStatus.connected);
         case RTCPeerConnectionState.RTCPeerConnectionStateConnecting:
           onStatus(PeerStatus.connecting);
         case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
@@ -2069,16 +2379,32 @@ class PeerClient {
           break;
       }
     };
-    pc.onIceConnectionState = (state) => onLog('ICE state: $state');
+    pc.onIceConnectionState = (state) {
+      if (identical(_peerConnection, pc)) onLog('ICE state: $state');
+    };
     pc.onTrack = (event) {
-      unawaited(_attachRemoteTrack(event));
+      if (identical(_peerConnection, pc)) {
+        unawaited(_attachRemoteTrack(event, pc));
+      }
     };
   }
 
-  Future<void> _attachRemoteTrack(RTCTrackEvent event) async {
+  Future<void> _attachRemoteTrack(
+    RTCTrackEvent event,
+    RTCPeerConnection peerConnection,
+  ) async {
     final stream = event.streams.isNotEmpty
         ? event.streams.first
         : _remoteStream ?? await createLocalMediaStream('peep-remote');
+    if (!identical(_peerConnection, peerConnection)) return;
+    if (event.track.kind == 'video') {
+      void refresh() {
+        if (identical(_peerConnection, peerConnection)) onMediaChanged();
+      }
+
+      event.track.onMute = refresh;
+      event.track.onUnMute = refresh;
+    }
     if (event.streams.isEmpty) await stream.addTrack(event.track);
     _remoteStream = stream;
     _remoteRenderer.srcObject = stream;
@@ -2093,10 +2419,8 @@ class PeerClient {
     if (!audio && !video) return;
     await _requestMediaPermissions(audio: audio, video: video);
     final stream = await navigator.mediaDevices.getUserMedia({
-      'audio': audio,
-      'video': video
-          ? {'width': 1280, 'height': 720, 'facingMode': 'user'}
-          : false,
+      'audio': audio ? nativeAudioConstraints(_mediaSettings) : false,
+      'video': video ? nativeVideoConstraints(_mediaSettings) : false,
     });
     _localStream ??= await createLocalMediaStream('peep-local');
     for (final track in stream.getTracks()) {
@@ -2105,7 +2429,7 @@ class PeerClient {
       );
       if (!alreadyPresent) {
         await _localStream!.addTrack(track);
-        await _peerConnection!.addTrack(track, _localStream!);
+        await attachNativeMediaTrack(_peerConnection!, _localStream!, track);
       }
     }
     _localRenderer.srcObject = _localStream;
@@ -2115,6 +2439,9 @@ class PeerClient {
   }
 
   Future<bool> _stopLocalVideoTracks() async {
+    final connection = _peerConnection;
+    if (connection != null) await detachNativeVideoSenders(connection);
+    _screenSharePaused = false;
     final stream = _localStream;
     final tracks = List<MediaStreamTrack>.from(
       stream?.getVideoTracks() ?? const [],
@@ -2136,8 +2463,9 @@ class PeerClient {
   void _attachDataChannel(RTCDataChannel channel) {
     _dataChannel = channel;
     channel.onDataChannelState = (state) {
+      if (!identical(_dataChannel, channel)) return;
       if (state == RTCDataChannelState.RTCDataChannelOpen) {
-        unawaited(_handleDataChannelOpen());
+        unawaited(_handleDataChannelOpen(channel));
       } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
         if (!_closed) {
           _dataChannel = null;
@@ -2147,14 +2475,17 @@ class PeerClient {
       }
     };
     channel.onMessage = (message) {
-      if (!message.isBinary) _handleDataChannelMessage(message.text);
+      if (identical(_dataChannel, channel) && !message.isBinary) {
+        _handleDataChannelMessage(message.text);
+      }
     };
     if (channel.state == RTCDataChannelState.RTCDataChannelOpen) {
-      unawaited(_handleDataChannelOpen());
+      unawaited(_handleDataChannelOpen(channel));
     }
   }
 
-  Future<void> _handleDataChannelOpen() async {
+  Future<void> _handleDataChannelOpen(RTCDataChannel channel) async {
+    if (_closed || !identical(_dataChannel, channel)) return;
     onStatus(PeerStatus.connected);
     onLog('Data channel opened.');
     try {
@@ -2239,6 +2570,8 @@ class PeerClient {
   }
 
   Future<void> _stopCallMedia() async {
+    _screenCaptureGeneration++;
+    _screenSharePaused = false;
     final wasScreenSharing = _screenShareEnabled;
     for (final track in _localStream?.getTracks() ?? <MediaStreamTrack>[]) {
       track.stop();
@@ -2273,6 +2606,18 @@ class PeerClient {
   }
 
   Future<void> _sendAttachment(AttachmentData attachment) async {
+    validateAttachmentMetadata(
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    );
+    if (!isValidAttachmentDataUrl(
+      dataUrl: attachment.dataUrl,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    )) {
+      throw StateError('Could not prepare the selected attachment.');
+    }
     final id = 'attachment-${DateTime.now().microsecondsSinceEpoch}';
     await _sendControl({
       'kind': 'attachment-start',
@@ -2311,19 +2656,34 @@ class PeerClient {
         message['size'] is! int) {
       return;
     }
-    _incomingAttachments[message['id'] as String] = _IncomingAttachment(
-      name: message['name'] as String,
-      mimeType: message['mimeType'] as String,
-      size: message['size'] as int,
+    final id = message['id'] as String;
+    final name = message['name'] as String;
+    final mimeType = normalizeAttachmentMimeType(message['mimeType'] as String);
+    final size = message['size'] as int;
+    if (id.isEmpty || id.length > 128) return;
+    try {
+      validateAttachmentMetadata(name: name, mimeType: mimeType, size: size);
+    } on StateError {
+      onLog('Discarded an invalid or oversized attachment.');
+      return;
+    }
+    _incomingAttachments[id] = IncomingAttachmentPayload(
+      name: name,
+      mimeType: mimeType,
+      size: size,
     );
-    onLog('Receiving attachment: ${message['name']}.');
+    onLog('Receiving attachment: $name.');
   }
 
   void _handleAttachmentChunk(Map<String, dynamic> message) {
     final id = message['id'];
     final data = message['data'];
     if (id is String && data is String) {
-      _incomingAttachments[id]?.data.write(data);
+      final incoming = _incomingAttachments[id];
+      if (incoming != null && !incoming.appendChunk(data)) {
+        _incomingAttachments.remove(id);
+        onLog('Discarded an invalid attachment chunk.');
+      }
     }
   }
 
@@ -2332,12 +2692,17 @@ class PeerClient {
     if (id is! String) return;
     final incoming = _incomingAttachments.remove(id);
     if (incoming == null) return;
+    final dataUrl = incoming.takeValidatedDataUrl();
+    if (dataUrl == null) {
+      onLog('Discarded an incomplete or invalid attachment.');
+      return;
+    }
     final attachment = _registerAttachment(
       AttachmentData(
         name: incoming.name,
         mimeType: incoming.mimeType,
         size: incoming.size,
-        dataUrl: incoming.data.toString(),
+        dataUrl: dataUrl,
       ),
     );
     onMessage(
@@ -2538,21 +2903,34 @@ class PeerClient {
   }
 
   Future<void> _connectSocket(Uri uri) async {
+    final generation = _socketGeneration;
     final channel = WebSocketChannel.connect(uri);
     _socket = channel;
     await channel.ready.timeout(const Duration(seconds: 8));
+    if (_closed || generation != _socketGeneration) {
+      await channel.sink.close();
+      return;
+    }
     _socketOpen = true;
     onLog('Signaling connected.');
     _socketSubscription = channel.stream.listen(
       (data) {
-        if (data is String) unawaited(_handleSignal(data));
+        if (identical(_socket, channel) && data is String) {
+          _queueSignal(data, generation);
+        }
       },
       onError: (Object error, StackTrace stack) {
+        if (!identical(_socket, channel) || generation != _socketGeneration) {
+          return;
+        }
         _socketOpen = false;
         onStatus(PeerStatus.failed);
         onLog('Signaling socket error: $error');
       },
       onDone: () {
+        if (!identical(_socket, channel) || generation != _socketGeneration) {
+          return;
+        }
         _socketOpen = false;
         if (!_closed) onStatus(PeerStatus.disconnected);
         onLog('Signaling disconnected.');
@@ -2560,7 +2938,14 @@ class PeerClient {
     );
   }
 
-  Future<void> _handleSignal(String raw) async {
+  void _queueSignal(String raw, int generation) {
+    _signalTail = _signalTail.then((_) async {
+      if (_closed || generation != _socketGeneration) return;
+      await _handleSignal(raw, generation);
+    });
+  }
+
+  Future<void> _handleSignal(String raw, int generation) async {
     try {
       final decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) return;
@@ -2569,9 +2954,7 @@ class PeerClient {
           await _handleWelcome(decoded);
         case 'presence':
           if (decoded['event'] == 'left') {
-            _dataChannel = null;
-            onStatus(PeerStatus.waitingForPeer);
-            onMediaChanged();
+            await _resetPeerConnectionAfterPeerLeft();
           }
           onLog('Peer ${decoded['peer']} ${decoded['event']}.');
         case 'stored':
@@ -2591,12 +2974,53 @@ class PeerClient {
           await _handleCandidate(decoded);
       }
     } catch (error) {
+      if (_closed || generation != _socketGeneration) return;
       onStatus(PeerStatus.failed);
       onLog('Signal handling failed: $error');
     }
   }
 
+  Future<void> _resetPeerConnectionAfterPeerLeft() async {
+    final generation = ++_peerConnectionResetGeneration;
+    final dataChannel = _dataChannel;
+    final peerConnection = _peerConnection;
+    _dataChannel = null;
+    _peerConnection = null;
+    _remoteDescriptionSet = false;
+    _offerStarted = false;
+    _pendingCandidates.clear();
+
+    final reset = _finishPeerConnectionReset(
+      generation,
+      dataChannel,
+      peerConnection,
+    );
+    _peerConnectionReady = reset;
+    await reset;
+  }
+
+  Future<void> _finishPeerConnectionReset(
+    int generation,
+    RTCDataChannel? dataChannel,
+    RTCPeerConnection? peerConnection,
+  ) async {
+    await dataChannel?.close();
+    await peerConnection?.close();
+    await _stopCallMedia();
+    if (_closed ||
+        generation != _peerConnectionResetGeneration ||
+        !_socketOpen) {
+      return;
+    }
+    await _createPeerConnection(generation);
+    if (!_closed && generation == _peerConnectionResetGeneration) {
+      onStatus(PeerStatus.waitingForPeer);
+      onMediaChanged();
+    }
+  }
+
   Future<void> _handleWelcome(Map<String, dynamic> signal) async {
+    await _peerConnectionReady;
     if (signal['existingPeers'] is int &&
         (signal['existingPeers'] as int) > 0) {
       onLog('Room already has a peer. Starting WebRTC offer.');
@@ -2608,29 +3032,40 @@ class PeerClient {
   }
 
   Future<void> _createAndSendOffer({bool ensureDataChannel = false}) async {
+    await _peerConnectionReady;
     if (ensureDataChannel && _offerStarted) return;
     if (ensureDataChannel) _offerStarted = true;
+    final peerConnection = _peerConnection;
+    if (peerConnection == null || _closed) return;
     onStatus(PeerStatus.connecting);
     if (ensureDataChannel && _dataChannel == null) {
       _attachDataChannel(
-        await _peerConnection!.createDataChannel('chat', RTCDataChannelInit()),
+        await peerConnection.createDataChannel('chat', RTCDataChannelInit()),
       );
     }
-    final offer = await _peerConnection!.createOffer();
-    await _peerConnection!.setLocalDescription(offer);
+    if (!identical(_peerConnection, peerConnection)) return;
+    await applyNativeCodecPreferences(peerConnection, _mediaSettings, onLog);
+    final offer = await peerConnection.createOffer();
+    if (!identical(_peerConnection, peerConnection)) return;
+    await peerConnection.setLocalDescription(offer);
+    await _applySenderLimits(peerConnection);
     _sendSignal({'type': 'offer', 'description': offer.toMap()});
   }
 
   Future<void> _handleOffer(Map<String, dynamic> signal) async {
+    await _peerConnectionReady;
+    final peerConnection = _peerConnection;
+    if (peerConnection == null || _closed) return;
     final description = signal['description'];
     if (description is! Map<String, dynamic>) return;
     onStatus(PeerStatus.connecting);
-    await _peerConnection!.setRemoteDescription(
+    await peerConnection.setRemoteDescription(
       RTCSessionDescription(
         description['sdp'] as String?,
         description['type'] as String?,
       ),
     );
+    if (!identical(_peerConnection, peerConnection)) return;
     _remoteDescriptionSet = true;
     await _flushPendingCandidates();
     // For an accepted incoming call, add our microphone before creating the
@@ -2647,25 +3082,35 @@ class PeerClient {
         return;
       }
     }
-    final answer = await _peerConnection!.createAnswer();
-    await _peerConnection!.setLocalDescription(answer);
+    await applyNativeCodecPreferences(peerConnection, _mediaSettings, onLog);
+    final answer = await peerConnection.createAnswer();
+    if (!identical(_peerConnection, peerConnection)) return;
+    await peerConnection.setLocalDescription(answer);
+    await _applySenderLimits(peerConnection);
     _sendSignal({'type': 'answer', 'description': answer.toMap()});
   }
 
   Future<void> _handleAnswer(Map<String, dynamic> signal) async {
+    await _peerConnectionReady;
+    final peerConnection = _peerConnection;
+    if (peerConnection == null || _closed) return;
     final description = signal['description'];
     if (description is! Map<String, dynamic>) return;
-    await _peerConnection!.setRemoteDescription(
+    await peerConnection.setRemoteDescription(
       RTCSessionDescription(
         description['sdp'] as String?,
         description['type'] as String?,
       ),
     );
+    if (!identical(_peerConnection, peerConnection)) return;
     _remoteDescriptionSet = true;
     await _flushPendingCandidates();
+    await _applySenderLimits(_peerConnection!);
   }
 
   Future<void> _handleCandidate(Map<String, dynamic> signal) async {
+    await _peerConnectionReady;
+    if (_peerConnection == null || _closed) return;
     final candidate = signal['candidate'];
     if (candidate is! Map<String, dynamic>) return;
     if (!_remoteDescriptionSet) {
@@ -2900,3 +3345,5 @@ class _NativeAttachmentPlayerState extends State<_NativeAttachmentPlayer> {
     );
   }
 }
+
+Future<MediaCodecSupport> discoverMediaCodecs() => discoverNativeMediaCodecs();
