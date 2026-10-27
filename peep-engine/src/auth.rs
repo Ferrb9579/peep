@@ -83,6 +83,30 @@ impl AuthStore {
         let mut connection = self.connection.lock().map_err(lock_error)?;
         let transaction = connection.transaction().map_err(to_io_error)?;
 
+        for (column, value, message) in [
+            (
+                "username",
+                &username,
+                "That username is already taken. Choose another username.",
+            ),
+            (
+                "email",
+                &email,
+                "An account with that email already exists. Sign in instead.",
+            ),
+        ] {
+            let exists: bool = transaction
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM users WHERE {column} = ?1)"),
+                    params![value],
+                    |row| row.get(0),
+                )
+                .map_err(to_io_error)?;
+            if exists {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, message));
+            }
+        }
+
         transaction
             .execute(
                 "\
@@ -263,4 +287,35 @@ fn password_hash_error(error: argon2::password_hash::Error) -> io::Error {
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("auth sqlite connection lock poisoned")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_registration_is_readable_and_keeps_original_account() {
+        let store = AuthStore::open(":memory:").unwrap();
+        store
+            .register("alice@example.invalid", "alice", "password123")
+            .unwrap();
+        let duplicate_username = store
+            .register("other@example.invalid", "ALICE", "different123")
+            .unwrap_err();
+        assert_eq!(duplicate_username.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            duplicate_username
+                .to_string()
+                .contains("username is already taken")
+        );
+        let duplicate_email = store
+            .register("alice@example.invalid", "other", "different123")
+            .unwrap_err();
+        assert!(duplicate_email.to_string().contains("email already exists"));
+        assert!(store.login("alice", "password123").unwrap().is_some());
+        assert!(store.login("alice", "different123").unwrap().is_none());
+        store
+            .register("other@example.invalid", "other", "different123")
+            .unwrap();
+    }
 }

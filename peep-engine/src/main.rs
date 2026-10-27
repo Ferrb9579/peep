@@ -39,7 +39,20 @@ async fn main() -> io::Result<()> {
     let groups = GroupStore::open_from_env()?;
     let keys = KeyStore::open_from_env()?;
     let conferences = ConferenceStore::open_from_env()?;
-    let sfu = SfuServer::new()?;
+    let (track_ready_tx, mut track_ready_rx) = mpsc::unbounded_channel();
+    let sfu = SfuServer::new(track_ready_tx)?;
+    let media_rooms = Arc::clone(&rooms);
+    tokio::spawn(async move {
+        while let Some((group_id, owner)) = track_ready_rx.recv().await {
+            broadcast(
+                &media_rooms,
+                &format!("group:{group_id}"),
+                &owner,
+                json!({"type": "conference-refresh", "from": owner}).to_string(),
+            )
+            .await;
+        }
+    });
 
     println!("peep-engine signaling server listening on ws://{addr}/ws?room=demo&peer=alice");
 
@@ -181,29 +194,8 @@ async fn handle_connection(
 
     {
         let mut rooms = rooms.lock().await;
-        if let Some(peers) = rooms.get_mut(&room) {
-            // A user may reconnect before an older socket notices that it has
-            // closed. Only remove this connection's sender so the stale socket
-            // cannot evict the replacement connection from the room.
-            if peers
-                .get(&peer)
-                .is_some_and(|current| current.same_channel(&tx))
-            {
-                peers.remove(&peer);
-            }
-            if peers.is_empty() {
-                rooms.remove(&room);
-            }
-        }
+        remove_current_peer_and_broadcast(&mut rooms, &room, &peer, &tx);
     }
-
-    broadcast(
-        &rooms,
-        &room,
-        &peer,
-        json!({"type": "presence", "event": "left", "peer": peer}).to_string(),
-    )
-    .await;
 
     writer_task.abort();
     read_result
@@ -757,5 +749,91 @@ async fn broadcast(rooms: &Rooms, room: &str, sender: &str, message: String) {
 
     for peer in peers {
         let _ = peer.send(message.clone());
+    }
+}
+
+/// Removes a peer only when the closing socket is still the room's current
+/// connection for that peer. Keep the removal and leave notification under
+/// the same room lock so a reconnect cannot join between them and receive a
+/// stale `left` event from its previous socket.
+fn remove_current_peer_and_broadcast(
+    rooms: &mut HashMap<String, HashMap<String, PeerSender>>,
+    room: &str,
+    peer: &str,
+    tx: &PeerSender,
+) -> bool {
+    let (removed, room_is_empty) = {
+        let Some(peers) = rooms.get_mut(room) else {
+            return false;
+        };
+
+        if !peers
+            .get(peer)
+            .is_some_and(|current| current.same_channel(tx))
+        {
+            return false;
+        }
+
+        peers.remove(peer);
+        let message = json!({"type": "presence", "event": "left", "peer": peer}).to_string();
+        for recipient in peers.values() {
+            let _ = recipient.send(message.clone());
+        }
+        (true, peers.is_empty())
+    };
+
+    if room_is_empty {
+        rooms.remove(room);
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tokio::sync::mpsc;
+
+    use super::{PeerSender, remove_current_peer_and_broadcast};
+
+    #[test]
+    fn stale_socket_close_does_not_remove_or_announce_replacement_peer() {
+        let (old_sender, _old_receiver) = mpsc::unbounded_channel::<String>();
+        let (replacement_sender, _replacement_receiver) = mpsc::unbounded_channel::<String>();
+        let (alice_sender, mut alice_receiver) = mpsc::unbounded_channel::<String>();
+        let mut rooms: HashMap<String, HashMap<String, PeerSender>> = HashMap::new();
+        rooms.insert(
+            "dm:alice:bob".to_string(),
+            HashMap::from([
+                ("alice".to_string(), alice_sender),
+                ("bob".to_string(), replacement_sender.clone()),
+            ]),
+        );
+
+        assert!(!remove_current_peer_and_broadcast(
+            &mut rooms,
+            "dm:alice:bob",
+            "bob",
+            &old_sender,
+        ));
+        assert!(rooms["dm:alice:bob"]["bob"].same_channel(&replacement_sender));
+        assert!(alice_receiver.try_recv().is_err());
+
+        assert!(remove_current_peer_and_broadcast(
+            &mut rooms,
+            "dm:alice:bob",
+            "bob",
+            &replacement_sender,
+        ));
+        let leave: serde_json::Value = serde_json::from_str(
+            &alice_receiver
+                .try_recv()
+                .expect("current close notifies peers"),
+        )
+        .expect("leave notification is valid JSON");
+        assert_eq!(leave["type"], "presence");
+        assert_eq!(leave["event"], "left");
+        assert_eq!(leave["peer"], "bob");
+        assert!(!rooms["dm:alice:bob"].contains_key("bob"));
     }
 }
