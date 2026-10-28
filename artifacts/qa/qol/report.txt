@@ -1,0 +1,79 @@
+PEEP — QUALITY OF LIFE AND INTERACTION POLISH
+Completed: 2026-10-28 (Asia/Kolkata)
+
+CHANGES
+- Session-only drafts per direct/group conversation, including cursor position;
+  preserved through navigation/reconnect and cleared after sending or sign-out.
+- Desktop Enter sends; Shift+Enter inserts a line at the selection. Sending
+  retains focus, empty/disabled composers cannot send, and IME composition is
+  protected. Attachment preparation rejects duplicate requests and shows state.
+- Remote arrivals follow the latest view only when already near the bottom.
+  Reading older messages preserves position and shows a new-message count.
+- Conversation search matches text, attachment names and sender names; Ctrl/Cmd+F
+  opens it, Escape closes it, and closing restores the earlier reading position.
+- Message menus copy text with feedback or insert a plain-text quote while
+  preserving the existing composer draft. No new delivery/read status is implied.
+- Ctrl/Cmd+K focuses inbox search; Escape clears it. Empty filtered views offer
+  Reset filters, and refresh actions show progress and prevent repeated requests.
+- Call shortcuts M/V/F/G control microphone/camera/video focus/layout. Desktop
+  help lists the keys. A visible muted reminder remains in expanded video.
+  Keyboard shortcuts do not activate through a modal dialog.
+- Media settings show unsaved edits, highlight the matching preset, restore
+  defaults, and confirm saving. Screen-only restore leaves audio/camera intact.
+- Press, icon and tab transitions, ringing entrance and chat auto-scroll respect
+  reduced motion. Feedback replaces stale queued snackbars.
+- System Back from a conversation returns to inbox and preserves its draft.
+
+AUTOMATED VALIDATION
+flutter analyze --no-pub: no issues.
+flutter test --no-pub: 54 passed (42 existing + 12 new).
+cargo test --offline: 3 passed before committing the earlier engine changes.
+Production web release and synthetic headed-QA release: both built successfully.
+git diff --check: clean.
+New tests exercise draft isolation/selection/cleanup, Enter/Shift+Enter and IME,
+scroll preservation and catching up, search shortcuts/results/Escape, clipboard
+payload and quote preservation, invalid numeric drafts and screen-only restore,
+call shortcuts/modal isolation, reduced motion, inbox keyboard focus and filters.
+Existing tests include narrow layouts, large text and one-fps screen controls.
+
+HEADED VALIDATION
+The real app ran with an isolated SQLite engine and disposable accounts. Two
+browser clients exchanged encrypted messages using synthetic capture devices.
+Verified:
+- Shift+Enter created a multiline draft without sending; Enter delivered it once
+  to the peer and left the composer focused.
+- Copy showed success feedback; quote inserted the complete multiline message
+  above existing draft text and returned focus to the composer. Clipboard payload
+  correctness is asserted by the automated platform-channel test; external OS
+  clipboard integration is not independently established by this pass.
+- Leaving a quoted draft, opening another contact, and returning restored the
+  original draft; the second contact's composer was empty.
+- Signing out and signing back into the same account, then reopening the
+  conversation, left the composer empty. The previous session's draft was gone.
+- Ctrl+K, empty inbox search and Reset filters; Ctrl+F, case-insensitive message
+  filtering and Escape; media preset edits, unsaved state, restore and save.
+- Eighteen peer messages populated the chat. While reading earlier messages, a
+  further arrival left the visible messages in place and showed '1 new message'.
+  Clicking the button caught up without clearing the existing draft.
+- Incoming/accepted call with live synthetic video. M/V/G/F toggled microphone,
+  camera, layout and video focus. The muted reminder stayed visible. M did not
+  activate behind the keyboard-help modal; Escape restored normal call layout.
+- At 390 x 844 the call controls and muted reminder fit, and hang-up returned a
+  duration summary. Both calls were ended before completing QA.
+
+LIMITS
+Desktop browser emulation is not physical Android/iOS testing. Physical capture,
+OS screen pickers, touch gestures, cross-browser behavior and lossy production
+networks remain outside this pass. The synthetic harness is JavaScript-only;
+production compilation passes the WebAssembly dry run. The existing Cupertino
+font-family warning remains; the app does not use CupertinoIcons.
+
+EVIDENCE
+message-actions.jpg — multiline message with Copy/Quote actions.
+restored-draft.jpg — quote and original draft after switching conversations.
+conversation-search.jpg — case-insensitive conversation search.
+new-message-position.jpg — older messages remain visible with an arrival badge.
+media-unsaved.jpg — unsaved settings state and restore-defaults action.
+call-muted-expanded.jpg — expanded live video with muted reminder.
+mobile-call.jpg — call controls at 390 x 844.
+signed-out-draft-cleared.jpg — empty composer after sign-out and reauthentication.

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../models/call_session.dart';
 import '../peer.dart';
 import 'peep_theme.dart';
+import 'interaction_feedback.dart';
 
 class CallScreen extends StatefulWidget {
   const CallScreen({
@@ -148,6 +149,31 @@ class _CallScreenState extends State<CallScreen> {
       ..scaleByDouble(next, next, 1, 1);
   }
 
+  void _toggleVideoFocus() {
+    if (_focusedVideo != null) {
+      _closeVideo();
+      return;
+    }
+    final video = _participants.where((p) => p.viewType != null).firstOrNull;
+    if (video != null) _focus(video);
+  }
+
+  void _showShortcuts() => showDialog<void>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Call shortcuts'),
+      content: const Text(
+        'M  ·  Mute or unmute\nV  ·  Camera on or off\nF  ·  Expand or restore video\nG  ·  Switch participant layout\nEsc  ·  Exit expanded video',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Done'),
+        ),
+      ],
+    ),
+  );
+
   String get _status {
     if (widget.callState == CallState.incoming) return 'Incoming call';
     if (widget.callState == CallState.outgoing) {
@@ -177,6 +203,25 @@ class _CallScreenState extends State<CallScreen> {
       child: CallbackShortcuts(
         bindings: {
           const SingleActivator(LogicalKeyboardKey.escape): _closeVideo,
+          if (active) ...{
+            const SingleActivator(
+              LogicalKeyboardKey.keyM,
+              includeRepeats: false,
+            ): widget.onToggleMicrophone,
+            const SingleActivator(
+              LogicalKeyboardKey.keyV,
+              includeRepeats: false,
+            ): widget.onToggleCamera,
+            const SingleActivator(
+              LogicalKeyboardKey.keyF,
+              includeRepeats: false,
+            ): _toggleVideoFocus,
+            const SingleActivator(
+              LogicalKeyboardKey.keyG,
+              includeRepeats: false,
+            ): () =>
+                setState(() => _grid = !_grid),
+          },
         },
         child: Focus(
           autofocus: true,
@@ -245,6 +290,15 @@ class _CallScreenState extends State<CallScreen> {
                               color: PeepColors.mint,
                             ),
                           ),
+                        if (active && MediaQuery.sizeOf(context).width >= 600)
+                          IconButton(
+                            tooltip: 'Call shortcuts',
+                            onPressed: _showShortcuts,
+                            icon: const Icon(
+                              Icons.keyboard_outlined,
+                              color: PeepColors.mint,
+                            ),
+                          ),
                         IconButton(
                           tooltip: 'Call & media quality',
                           onPressed: widget.onMediaSettings,
@@ -256,6 +310,31 @@ class _CallScreenState extends State<CallScreen> {
                       ],
                     ),
                   ),
+                  if (active && !widget.microphoneEnabled)
+                    Padding(
+                      padding: EdgeInsets.only(bottom: 8),
+                      child: Semantics(
+                        liveRegion: true,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.mic_off_rounded,
+                              size: 14,
+                              color: PeepColors.mint,
+                            ),
+                            SizedBox(width: 6),
+                            Text(
+                              'Your microphone is off',
+                              style: TextStyle(
+                                color: PeepColors.mint,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   if (active && widget.screenShareEnabled && focused == null)
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -372,24 +451,20 @@ class _CallScreenState extends State<CallScreen> {
       return Column(
         children: [
           Expanded(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onDoubleTap: () => _setZoom(_scale > 1.01 ? 1 : 2, size),
-              child: ClipRect(
-                child: InteractiveViewer(
-                  key: const ValueKey('expanded-video'),
-                  transformationController: _zoom,
-                  minScale: 1,
-                  maxScale: 4,
-                  boundaryMargin: const EdgeInsets.all(100),
-                  child: SizedBox(
-                    width: size.width,
-                    height: math.max(1, size.height - 66),
-                    child: _tile(
-                      participant,
-                      expanded: true,
-                      onDoubleTap: () => _setZoom(_scale > 1.01 ? 1 : 2, size),
-                    ),
+            child: ClipRect(
+              child: InteractiveViewer(
+                key: const ValueKey('expanded-video'),
+                transformationController: _zoom,
+                minScale: 1,
+                maxScale: 4,
+                boundaryMargin: const EdgeInsets.all(100),
+                child: SizedBox(
+                  width: size.width,
+                  height: math.max(1, size.height - 66),
+                  child: _tile(
+                    participant,
+                    expanded: true,
+                    onDoubleTap: () => _setZoom(_scale > 1.01 ? 1 : 2, size),
                   ),
                 ),
               ),
@@ -465,7 +540,9 @@ class _CallScreenState extends State<CallScreen> {
           const SizedBox(height: 24),
           TweenAnimationBuilder<double>(
             tween: Tween(begin: .9, end: 1),
-            duration: const Duration(milliseconds: 650),
+            duration: MediaQuery.disableAnimationsOf(context)
+                ? Duration.zero
+                : const Duration(milliseconds: 650),
             builder: (context, value, child) =>
                 Transform.scale(scale: value, child: child),
             child: Container(
@@ -822,24 +899,30 @@ class _CallControl extends StatelessWidget {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        IconButton(
-          tooltip: label,
-          onPressed: onPressed,
-          style: IconButton.styleFrom(
-            minimumSize: const Size(54, 54),
-            backgroundColor: destructive
-                ? PeepColors.danger
-                : selected
-                ? PeepColors.mint
-                : const Color(0xff2c464e),
-            foregroundColor: selected && !destructive
-                ? PeepColors.navy
-                : Colors.white,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(18),
+        PeepPress(
+          enabled: onPressed != null,
+          child: IconButton(
+            tooltip: label,
+            onPressed: onPressed,
+            style: IconButton.styleFrom(
+              minimumSize: const Size(54, 54),
+              backgroundColor: destructive
+                  ? PeepColors.danger
+                  : selected
+                  ? PeepColors.mint
+                  : const Color(0xff2c464e),
+              foregroundColor: selected && !destructive
+                  ? PeepColors.navy
+                  : Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+              ),
+            ),
+            icon: AnimatedSwitcher(
+              duration: peepMotion(context),
+              child: Icon(icon, key: ValueKey(icon), size: 22),
             ),
           ),
-          icon: Icon(icon, size: 22),
         ),
         const SizedBox(height: 8),
         Text(

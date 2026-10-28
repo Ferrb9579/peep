@@ -42,6 +42,32 @@ The engine listens on `127.0.0.1:8787` by default (`PEEP_ENGINE_ADDR` overrides 
 Its SQLite path defaults to `peep-mailboxes.sqlite3`; use `PEEP_DB_PATH` or
 `PEEP_MAILBOX_PATH` to choose another database.
 
+## Everyday controls
+
+- Each direct and group conversation keeps its own unsent draft for the current
+  signed-in session, including cursor position. Leaving and reopening a chat
+  restores it; sending clears it. Drafts are kept in memory and disappear after
+  sign-out, app restart, or browser reload.
+- On desktop, **Enter** sends and **Shift+Enter** inserts a line. Sending keeps
+  the composer focused. Input methods can finish composing before a send.
+- Incoming messages follow the latest view when you are already there. While
+  reading earlier messages, they leave your position alone and show a new-message
+  count. **Jump to latest** catches up.
+- **Search messages** filters the open conversation by text, attachment name,
+  or sender. **Ctrl/Cmd+F** opens it and **Escape** closes it. Closing search
+  restores your previous reading position.
+- Each message's menu offers **Copy message** and **Quote in reply**. Quotes
+  become plain text in the composer and preserve the existing draft.
+- **Ctrl/Cmd+K** focuses inbox search. **Escape** clears it; **Reset filters**
+  recovers from an empty search/unread view. Refresh and attachment actions
+  prevent duplicate requests while pending.
+- Call shortcuts: **M** toggles the microphone, **V** the camera, **F** expands
+  video, **G** switches layout, and **Escape** exits expanded video. The keyboard
+  button lists them on desktop. A reminder stays visible while muted.
+- Media settings show unsaved edits, offer **Restore defaults**, and confirm a
+  successful save. Screen-only defaults preserve camera and audio preferences.
+- Button press, icon, tab, and ringing transitions respect reduced motion.
+
 ## Call and media preferences
 
 Incoming calls have an accept/decline screen; outgoing calls show ringing and

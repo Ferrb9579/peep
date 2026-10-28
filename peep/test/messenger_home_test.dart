@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:peep/ui/messenger_home.dart';
 import 'package:peep/webrtc_peer_stub.dart'
@@ -209,6 +210,57 @@ void main() {
       await tester.pumpAndSettle();
       expect(attempts, 2);
       expect(find.text('New group'), findsNothing);
+    },
+  );
+  testWidgets(
+    'keyboard search works before clicking a field and Escape clears it',
+    (tester) async {
+      await tester.pumpWidget(buildHome());
+      await tester.pumpAndSettle();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+      final search = tester.widget<TextField>(
+        find.widgetWithText(TextField, 'Search or start a conversation'),
+      );
+      expect(search.focusNode!.hasFocus, true);
+      await tester.enterText(find.byType(TextField), 'nothing');
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(search.controller!.text, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'empty filtered results can reset both search and unread filters',
+    (tester) async {
+      await tester.pumpWidget(
+        buildHome(
+          entries: [
+            ChatListEntry(
+              contactUsername: 'Maya',
+              lastText: 'Hello',
+              updatedAt: DateTime(2026),
+              unreadCount: 0,
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Unread'));
+      await tester.enterText(find.byType(TextField), 'missing');
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Reset filters'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Reset filters'));
+      await tester.pumpAndSettle();
+      expect(find.text('Maya'), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+      expect(tester.takeException(), null);
     },
   );
 }

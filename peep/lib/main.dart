@@ -9,10 +9,12 @@ import 'peer.dart';
 import 'ui/account_screen.dart';
 import 'ui/conversation_screen.dart';
 import 'ui/peep_theme.dart';
+import 'ui/interaction_feedback.dart';
 import 'ui/media_settings_sheet.dart';
 import 'media/media_settings.dart';
 import 'models/conversation_id.dart';
 import 'models/call_session.dart';
+import 'models/conversation_drafts.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -66,6 +68,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
   final _groupMembersController = TextEditingController();
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
+  final _drafts = ConversationDrafts();
 
   late final PeerClient _client;
   late final GroupClient _groupClient;
@@ -76,6 +79,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
   final _mediaSettingsStore = MediaSettingsStore();
   MediaSettings _mediaSettings = MediaSettings.defaults;
   bool _groupsBusy = false;
+  bool _attachmentBusy = false;
   bool _openingConversation = false;
   bool _isInForeground = true;
   bool _groupChatActive = false;
@@ -129,7 +133,6 @@ class _PeerChatScreenState extends State<PeerChatScreen>
         if (mounted) {
           setState(() => _messages.add(message));
           _saveActiveHistory();
-          _scrollToEnd();
           if (!message.isLocal && !_isInForeground && !_groupChatActive) {
             unawaited(
               showIncomingMessageNotification(
@@ -155,7 +158,6 @@ class _PeerChatScreenState extends State<PeerChatScreen>
         if (mounted) {
           setState(() => _messages.add(message));
           _saveActiveHistory();
-          _scrollToEnd();
         }
       },
       onLog: _addLog,
@@ -353,6 +355,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
         _groupChatActive = false;
         _activeTitle = contact;
         _activeSubtitle = 'Direct message';
+        _drafts.open(conversationKey, _messageController);
         _activeConversationKey = conversationKey;
         _activeGroup = null;
         _messages
@@ -386,6 +389,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
   }
 
   Future<void> _disconnect() async {
+    _drafts.open(null, _messageController);
     _outgoingCallTimeout?.cancel();
     _outgoingCallTimeout = null;
     _callSession.reset();
@@ -410,6 +414,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
   }
 
   Future<void> _signOut() async {
+    _drafts.clear(_messageController);
     _outgoingCallTimeout?.cancel();
     _outgoingCallTimeout = null;
     _callSession.reset();
@@ -620,6 +625,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
         _groupChatActive = true;
         _activeTitle = group.name;
         _activeSubtitle = '${group.members.length} members';
+        _drafts.open(conversationKey, _messageController);
         _activeConversationKey = conversationKey;
         _activeGroup = group;
         _messages
@@ -780,16 +786,24 @@ class _PeerChatScreenState extends State<PeerChatScreen>
       return;
     }
 
+    final queued = !_groupChatActive && !_client.canMessage;
     if (_groupChatActive) {
       _groupClient.send(text);
     } else {
       _client.send(text);
     }
     _messageController.clear();
-    _scrollToEnd();
+    if (queued) {
+      showPeepFeedback(
+        context,
+        'Message queued until this conversation reconnects.',
+      );
+    }
   }
 
   Future<void> _sendAttachment() async {
+    if (_attachmentBusy) return;
+    setState(() => _attachmentBusy = true);
     try {
       if (_groupChatActive) {
         await _groupClient.pickAndSendAttachment();
@@ -799,6 +813,8 @@ class _PeerChatScreenState extends State<PeerChatScreen>
     } catch (error) {
       _addLog('Attachment failed: $error');
       _showError(error);
+    } finally {
+      if (mounted) setState(() => _attachmentBusy = false);
     }
   }
 
@@ -902,19 +918,6 @@ class _PeerChatScreenState extends State<PeerChatScreen>
     final entries = entriesByContact.values.toList(growable: false);
     entries.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return entries;
-  }
-
-  void _scrollToEnd() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scrollController.hasClients) {
-        return;
-      }
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 180),
-        curve: Curves.easeOut,
-      );
-    });
   }
 
   @override
@@ -1051,6 +1054,7 @@ class _PeerChatScreenState extends State<PeerChatScreen>
               onMediaSettings: _showMediaSettings,
             );
             final chat = ConversationPanel(
+              key: ValueKey(_activeConversationKey),
               messages: _messages,
               scrollController: _scrollController,
               messageController: _messageController,
@@ -1065,18 +1069,25 @@ class _PeerChatScreenState extends State<PeerChatScreen>
                   : _client.canMessage,
               onSend: _sendMessage,
               onAttach: _sendAttachment,
+              attachmentBusy: _attachmentBusy,
             );
 
-            return Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 1440),
-                child: Padding(
-                  padding: EdgeInsets.all(wide ? 24 : 0),
-                  child: Column(
-                    children: [
-                      chatHeader,
-                      Expanded(child: chat),
-                    ],
+            return PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, _) {
+                if (!didPop && !_openingConversation) unawaited(_disconnect());
+              },
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 1440),
+                  child: Padding(
+                    padding: EdgeInsets.all(wide ? 24 : 0),
+                    child: Column(
+                      children: [
+                        chatHeader,
+                        Expanded(child: chat),
+                      ],
+                    ),
                   ),
                 ),
               ),

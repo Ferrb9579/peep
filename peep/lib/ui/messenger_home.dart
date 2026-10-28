@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'interaction_feedback.dart';
 
 import '../peer.dart';
 import 'peep_theme.dart';
@@ -88,6 +90,8 @@ class _MessengerHomeState extends State<MessengerHome> {
   static const _muted = PeepColors.muted;
   static const _border = PeepColors.border;
   final _searchController = TextEditingController();
+  final _searchFocus = FocusNode(debugLabel: 'Search conversations');
+  bool _refreshing = false;
   int _tabIndex = 0;
   String _searchQuery = '';
   bool _unreadOnly = false;
@@ -95,7 +99,29 @@ class _MessengerHomeState extends State<MessengerHome> {
   @override
   void dispose() {
     _searchController.dispose();
+    _searchFocus.dispose();
     super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    if (_refreshing || widget.groupsBusy) return;
+    setState(() => _refreshing = true);
+    try {
+      await widget.onRefreshGroups();
+    } catch (_) {
+      if (mounted) {
+        showPeepFeedback(context, 'Could not refresh. Please try again.');
+      }
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
+
+  void _focusSearch() {
+    setState(() => _tabIndex = 0);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _searchFocus.requestFocus();
+    });
   }
 
   void _showNewChat() {
@@ -226,7 +252,7 @@ class _MessengerHomeState extends State<MessengerHome> {
         ),
     ];
     return RefreshIndicator(
-      onRefresh: widget.onRefreshGroups,
+      onRefresh: _refresh,
       child: CustomScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -243,6 +269,7 @@ class _MessengerHomeState extends State<MessengerHome> {
                     ),
                   TextField(
                     controller: _searchController,
+                    focusNode: _searchFocus,
                     onChanged: (value) => setState(() => _searchQuery = value),
                     textInputAction: TextInputAction.search,
                     decoration: InputDecoration(
@@ -282,14 +309,22 @@ class _MessengerHomeState extends State<MessengerHome> {
                       ),
                       IconButton(
                         tooltip: 'Refresh conversations',
-                        onPressed: widget.groupsBusy
+                        onPressed: widget.groupsBusy || _refreshing
                             ? null
-                            : widget.onRefreshGroups,
-                        icon: const Icon(
-                          Icons.refresh_rounded,
-                          size: 20,
-                          color: _muted,
-                        ),
+                            : _refresh,
+                        icon: _refreshing
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(
+                                Icons.refresh_rounded,
+                                size: 20,
+                                color: _muted,
+                              ),
                       ),
                     ],
                   ),
@@ -298,8 +333,7 @@ class _MessengerHomeState extends State<MessengerHome> {
             ),
           ),
           if (empty)
-            SliverFillRemaining(
-              hasScrollBody: false,
+            SliverToBoxAdapter(
               child: _MessengerEmpty(
                 icon: hasSourceContent
                     ? Icons.search_off_rounded
@@ -310,8 +344,15 @@ class _MessengerHomeState extends State<MessengerHome> {
                 message: hasSourceContent
                     ? 'Try another search or switch back to all conversations.'
                     : 'Your next good conversation starts with a hello.',
-                actionLabel: hasSourceContent ? null : 'Start a conversation',
-                onAction: hasSourceContent ? null : _showNewChat,
+                actionLabel: hasSourceContent
+                    ? 'Reset filters'
+                    : 'Start a conversation',
+                onAction: hasSourceContent
+                    ? () {
+                        _clearSearch();
+                        setState(() => _unreadOnly = false);
+                      }
+                    : _showNewChat,
               ),
             )
           else
@@ -565,7 +606,12 @@ class _MessengerHomeState extends State<MessengerHome> {
               ],
             ),
           ),
-          Expanded(child: body),
+          Expanded(
+            child: AnimatedSwitcher(
+              duration: peepMotion(context),
+              child: KeyedSubtree(key: ValueKey(_tabIndex), child: body),
+            ),
+          ),
           if (_tabIndex == 0)
             Padding(
               padding: const EdgeInsets.only(bottom: 16, top: 8),
@@ -583,50 +629,65 @@ class _MessengerHomeState extends State<MessengerHome> {
             ),
         ],
       );
-      return Material(
-        color: PeepColors.canvas,
-        child: Row(
-          children: [
-            if (wide) _sidebar(),
-            Expanded(
-              child: Column(
-                children: [
-                  Expanded(
-                    child: Align(
-                      alignment: Alignment.topCenter,
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 960),
-                        child: content,
+      return CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.keyK, control: true):
+              _focusSearch,
+          const SingleActivator(LogicalKeyboardKey.keyK, meta: true):
+              _focusSearch,
+          const SingleActivator(LogicalKeyboardKey.escape): () {
+            _clearSearch();
+            _searchFocus.unfocus();
+          },
+        },
+        child: Focus(
+          autofocus: true,
+          child: Material(
+            color: PeepColors.canvas,
+            child: Row(
+              children: [
+                if (wide) _sidebar(),
+                Expanded(
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: Align(
+                          alignment: Alignment.topCenter,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 960),
+                            child: content,
+                          ),
+                        ),
                       ),
-                    ),
+                      if (!wide)
+                        NavigationBar(
+                          selectedIndex: _tabIndex,
+                          onDestinationSelected: (index) =>
+                              setState(() => _tabIndex = index),
+                          destinations: const [
+                            NavigationDestination(
+                              icon: Icon(Icons.chat_bubble_outline_rounded),
+                              selectedIcon: Icon(Icons.chat_bubble_rounded),
+                              label: 'Chats',
+                            ),
+                            NavigationDestination(
+                              icon: Icon(Icons.call_outlined),
+                              selectedIcon: Icon(Icons.call_rounded),
+                              label: 'Calls',
+                            ),
+                            NavigationDestination(
+                              icon: Icon(Icons.settings_outlined),
+                              selectedIcon: Icon(Icons.settings_rounded),
+                              label: 'Settings',
+                            ),
+                          ],
+                        ),
+                    ],
                   ),
-                  if (!wide)
-                    NavigationBar(
-                      selectedIndex: _tabIndex,
-                      onDestinationSelected: (index) =>
-                          setState(() => _tabIndex = index),
-                      destinations: const [
-                        NavigationDestination(
-                          icon: Icon(Icons.chat_bubble_outline_rounded),
-                          selectedIcon: Icon(Icons.chat_bubble_rounded),
-                          label: 'Chats',
-                        ),
-                        NavigationDestination(
-                          icon: Icon(Icons.call_outlined),
-                          selectedIcon: Icon(Icons.call_rounded),
-                          label: 'Calls',
-                        ),
-                        NavigationDestination(
-                          icon: Icon(Icons.settings_outlined),
-                          selectedIcon: Icon(Icons.settings_rounded),
-                          label: 'Settings',
-                        ),
-                      ],
-                    ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       );
     },
@@ -664,44 +725,50 @@ class _MessengerHomeState extends State<MessengerHome> {
                   ? const Color(0xff2b484e)
                   : Colors.transparent,
               borderRadius: BorderRadius.circular(14),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(14),
-                onTap: () => setState(() => _tabIndex = index),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Row(
-                    children: [
-                      Icon(
-                        [
-                          Icons.forum_outlined,
-                          Icons.call_outlined,
-                          Icons.settings_outlined,
-                        ][index],
-                        color: _tabIndex == index
-                            ? PeepColors.mint
-                            : const Color(0xffa9bec1),
-                        size: 21,
-                      ),
-                      const SizedBox(width: 14),
-                      Text(
-                        ['Chats', 'Calls', 'Settings'][index],
-                        style: TextStyle(
+              child: Semantics(
+                selected: _tabIndex == index,
+                button: true,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: () => setState(() => _tabIndex = index),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Icon(
+                          [
+                            Icons.forum_outlined,
+                            Icons.call_outlined,
+                            Icons.settings_outlined,
+                          ][index],
                           color: _tabIndex == index
-                              ? Colors.white
+                              ? PeepColors.mint
                               : const Color(0xffa9bec1),
-                          fontWeight: FontWeight.w600,
+                          size: 21,
                         ),
-                      ),
-                      if (index == 0 &&
-                          widget.chatEntries.any((e) => e.unreadCount > 0)) ...[
-                        const Spacer(),
-                        const Icon(
-                          Icons.circle,
-                          size: 7,
-                          color: PeepColors.mint,
+                        const SizedBox(width: 14),
+                        Text(
+                          ['Chats', 'Calls', 'Settings'][index],
+                          style: TextStyle(
+                            color: _tabIndex == index
+                                ? Colors.white
+                                : const Color(0xffa9bec1),
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
+                        if (index == 0 &&
+                            widget.chatEntries.any(
+                              (e) => e.unreadCount > 0,
+                            )) ...[
+                          const Spacer(),
+                          const Icon(
+                            Icons.circle,
+                            size: 7,
+                            color: PeepColors.mint,
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),

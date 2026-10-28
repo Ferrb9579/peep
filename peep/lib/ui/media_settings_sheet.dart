@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'interaction_feedback.dart';
 import 'package:flutter/services.dart';
 
 import '../media/media_settings.dart';
@@ -49,6 +51,10 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
   MediaCodecSupport _codecs = const MediaCodecSupport();
   bool _loading = true;
   bool _saving = false;
+  bool _edited = false;
+  int _formRevision = 0;
+  bool get _dirty =>
+      _edited || !mapEquals(_settings.toJson(), widget.settings.toJson());
   String? _error;
   @override
   void initState() {
@@ -88,6 +94,7 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
       final error = await widget.onSave(_settings);
       if (!mounted) return;
       if (error == null) {
+        showPeepFeedback(context, 'Media preferences saved');
         Navigator.of(context).pop();
       } else {
         setState(() {
@@ -103,6 +110,23 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
         });
       }
     }
+  }
+
+  void _restoreDefaults() {
+    FocusScope.of(context).unfocus();
+    _formKey.currentState?.reset();
+    setState(() {
+      _settings = widget.screenOnly
+          ? _settings.copyWith(
+              screenQuality: MediaSettings.defaults.screenQuality,
+              screenFrameRate: MediaSettings.defaults.screenFrameRate,
+              screenBitrateKbps: MediaSettings.defaults.screenBitrateKbps,
+            )
+          : MediaSettings.defaults;
+      _formRevision++;
+      _edited = false;
+      _error = null;
+    });
   }
 
   Widget _heading(String title, IconData icon) => Padding(
@@ -157,7 +181,7 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
     String unit,
     ValueChanged<int> onChanged,
   ) => _NumberControl(
-    key: ValueKey(title),
+    key: ValueKey('$title:$_formRevision'),
     label: title,
     value: value,
     min: min,
@@ -176,6 +200,9 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
   @override
   Widget build(BuildContext context) => Form(
     key: _formKey,
+    onChanged: () {
+      if (!_edited) setState(() => _edited = true);
+    },
     child: FractionallySizedBox(
       heightFactor: .9,
       child: Column(
@@ -206,6 +233,29 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  Wrap(
+                    alignment: WrapAlignment.spaceBetween,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 12,
+                    children: [
+                      Semantics(
+                        liveRegion: true,
+                        child: Text(
+                          _dirty
+                              ? 'Unsaved changes'
+                              : 'Your current preferences',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: PeepColors.muted,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _saving ? null : _restoreDefaults,
+                        child: const Text('Restore defaults'),
+                      ),
+                    ],
+                  ),
                   Text(
                     widget.inCall
                         ? 'Bitrate and frame-rate limits apply now. Screen resolution changes apply live in browsers; on other devices, share again to change capture size. Camera capture and codecs update when media starts again.'
@@ -223,15 +273,19 @@ class _MediaSettingsSheetState extends State<MediaSettingsSheet> {
                       runSpacing: 8,
                       children: [
                         for (final preset in MediaPreset.values)
-                          ActionChip(
+                          ChoiceChip(
+                            selected: mapEquals(
+                              _settings.toJson(),
+                              MediaSettings.preset(preset).toJson(),
+                            ),
                             label: Text(switch (preset) {
                               MediaPreset.dataSaver => 'Data saver',
                               MediaPreset.balanced => 'Balanced',
                               MediaPreset.highQuality => 'High quality',
                             }),
-                            onPressed: _saving
+                            onSelected: _saving
                                 ? null
-                                : () => setState(
+                                : (_) => setState(
                                     () => _settings = MediaSettings.preset(
                                       preset,
                                     ),
